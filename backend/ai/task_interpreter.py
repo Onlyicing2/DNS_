@@ -1,0 +1,881 @@
+"""Natural-language task interpretation without persistence or execution authority."""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import time
+from dataclasses import replace
+from typing import Any
+
+from backend.ai.providers.base.contract import ProviderResponse
+from backend.ai.proactive import has_proactive_authorization
+from backend.ai.task_candidate import TaskCandidate, TaskCandidateError, parse_candidate_output
+from backend.ai.task_contract import MAX_AI_INSTRUCTION_CHARS, ground_ai_instruction
+
+logger = logging.getLogger(__name__)
+
+INTERPRET_TIMEOUT_SECONDS = 30.0
+MAX_REQUEST_CHARS = 2000
+
+_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+
+_SCHEDULE_INTERVAL = {
+    "type": "object", "additionalProperties": False,
+    "required": ["seconds"],
+    "properties": {"seconds": {"type": "number", "exclusiveMinimum": 0}},
+}
+_SCHEDULE_ONCE = {
+    "type": "object", "additionalProperties": False,
+    "required": ["at", "timezone"],
+    "properties": {
+        "at": {"type": "string", "description": "naive local datetime, ISO 8601, e.g. 2026-09-03T09:00:00"},
+        "timezone": {"type": "string"},
+    },
+}
+_SCHEDULE_DAILY = {
+    "type": "object", "additionalProperties": False,
+    "required": ["hour", "timezone"],
+    "properties": {
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+        "second": {"type": "integer", "minimum": 0, "maximum": 59},
+        "timezone": {"type": "string"},
+    },
+}
+_SCHEDULE_WEEKLY = {
+    "type": "object", "additionalProperties": False,
+    "required": ["weekday", "hour", "timezone"],
+    "properties": {
+        "weekday": {"type": "integer", "minimum": 0, "maximum": 6,
+                     "description": "0=Monday .. 6=Sunday"},
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+        "second": {"type": "integer", "minimum": 0, "maximum": 59},
+        "timezone": {"type": "string"},
+    },
+}
+
+CANDIDATE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["label", "schedule_type", "schedule", "timezone", "actions", "notification_destination"],
+    "properties": {
+        "label": {"type": "string"},
+        "schedule_type": {"type": "string", "enum": ["once", "interval", "daily", "weekly", "event"]},
+        "schedule": {
+            "type": "object",
+            "description": (
+                "interval: {'seconds': <positive number>}; "
+                "once: {'at': '<naive local ISO datetime>', 'timezone': '...'}; "
+                "daily: {'hour': 0-23, 'minute': 0-59, 'timezone': '...'}; "
+                "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, 'timezone': '...'}; "
+                "event: {'trigger': {'type': 'telegram_message', ...}} — fires when a "
+                "matching Telegram message arrives (no wall-clock time)"
+            ),
+        },
+        "timezone": {"type": "string"},
+        "actions": {
+            "type": "array",
+            "maxItems": 5,
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                    "not_before": {
+                        "type": "string",
+                        "description": (
+                            "OPTIONAL per-action wait boundary: an ISO-8601 date+time "
+                            "(naive = the task timezone), e.g. '2026-09-26T18:00:00'. "
+                            "This action must not run before that instant; earlier "
+                            "actions still run at the task's own boundary."
+                        ),
+                    },
+                    "condition": {
+                        "type": "object",
+                        "description": (
+                            "A CONDITION action declares NO name and NO arguments: it "
+                            "compares ONE declared output field of an EARLIER action of "
+                            "the same run. Exactly: {'source': {'action': <number of an "
+                            "earlier action>, 'field': '<its declared output field>'}, "
+                            "'operator': 'equals' | 'not_equals', 'value': <text | boolean "
+                            "| number | null>}. Never code, an expression, a nested "
+                            "object or a new tool. At most ONE condition per task, and "
+                            "every action AFTER it must declare 'branch'."
+                        ),
+                    },
+                    "branch": {
+                        "type": "string",
+                        "enum": ["true", "false"],
+                        "description": (
+                            "ONLY together with a condition action: which branch this "
+                            "action belongs to. Exactly one branch runs; all actions "
+                            "after the condition must declare it, the true-branch "
+                            "actions come first, and each branch needs at least one "
+                            "action."
+                        ),
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "ONLY for the 'ask_owner' tool: the single bounded "
+                            "plain-text question to send the owner. The workflow "
+                            "pauses until the owner replies to it. Several "
+                            "ask_owner actions are allowed (one per checkpoint); "
+                            "each reply is consumed through that question's own "
+                            "action number. Actions and questions may interleave "
+                            "in one chain; the answer only feeds already-defined "
+                            "actions."
+                        ),
+                    },
+                },
+            },
+        },
+        "notification_destination": {"type": "object"},
+        "ai_instruction": {
+            "type": "string",
+            "description": (
+                "For AI-generated per-run content ONLY: the user's request VERBATIM "
+                "(never paraphrased or translated) so source/character/language/length "
+                "and source-display requirements are enforced at each occurrence. "
+                "Omit for static content."
+            ),
+        },
+    },
+}
+
+
+class TaskInterpretationError(ValueError):
+    """Natural-language interpretation did not yield a safe candidate."""
+
+
+#: Appended to the planning instructions ONLY when the owner's own message
+#: explicitly authorizes proactive initiative (the shared detector in
+#: ``backend.ai.proactive`` — per-request, fail-closed). This RELAXES nothing:
+#: every existing contract above still applies verbatim; what it adds is the
+#: permission to derive a small ordered chain toward the stated goal instead
+#: of the single literally-named action, inside the SAME unchanged 1..5
+#: action bound (schema ``maxItems: 5`` → ``MAX_ACTIONS``).
+PROACTIVE_EXPANSION_INSTRUCTIONS = (
+    "PROACTIVE EXPANSION (AUTHORIZED — the owner's message explicitly permits "
+    "useful additional work toward THIS goal): within this ONE candidate you may "
+    "derive a small ordered action chain instead of only the literally named "
+    "action(s). Hard rules: (a) every derived action must directly help complete, "
+    "verify, or report the owner's requested goal — never unrelated work, never "
+    "actions that merely demonstrate initiative; (b) the chain stays 1..5 actions "
+    "(the schema's maxItems=5 is unchanged — never more, never a second task, and "
+    "'create_task' may NEVER appear inside actions: a task cannot create tasks); "
+    "(c) use ONLY already-registered action names with their declared arguments — "
+    "an unregistered or confirmation-gated action is rejected at creation; "
+    "(d) keep dependent actions ordered AFTER the action whose result they need, "
+    "and never pretend an earlier action succeeded; (e) all other contracts are "
+    "UNCHANGED — still never invent schedule, content, source, language, "
+    "destination, recurrence, or generation requirements (NON-INVENTION CONTRACT), "
+    "still return JSON null when the request is genuinely ambiguous (NULL RULE), "
+    "and the conditional/branch, question, and wait contracts are untouched; "
+    "(f) this authorization never bypasses safety: no confirmation-free destructive "
+    "actions, no new side-effect categories (no arbitrary Telegram RPC, SQL, "
+    "filesystem, HTTP, or shell), and no changes to unrelated saved items, chats, "
+    "or account state."
+)
+
+
+class TaskUnsupportedError(TaskInterpretationError):
+    """The request is semantically clear but asks for a capability the
+    current task/schedule/event model cannot represent (e.g. monthly/yearly
+    calendar recurrence). Distinct from ambiguity so the caller can answer
+    honestly instead of with the generic ambiguity rejection.
+    """
+
+    def __init__(self, capability: str) -> None:
+        super().__init__(f"unsupported capability: {capability}")
+        self.capability = capability
+
+
+#: Destination keys a parsed model candidate may keep. ``chat_name`` is a
+#: NAME the creation path resolves against the authenticated account's dialogs;
+#: the two flags are the only candidate-declared task-definition options. Every
+#: other key is either a destination IDENTIFIER (``chat_id``, ``chat_title``)
+#: or an unknown value, and identifiers are resolved from trusted runtime
+#: context only.
+_KEEP_DESTINATION_KEYS = frozenset({"chat_name", "deliver_result", "notify_on_outcome"})
+
+
+def _without_untrusted_destination_identifiers(candidate: TaskCandidate) -> TaskCandidate:
+    """Drop model-supplied destination identifiers from a parsed candidate.
+
+    A numeric ``chat_id``/``chat_title`` in provider output must never become
+    authoritative for a scheduled side effect merely because the model sent
+    it: only trusted runtime resolution (the request chat or a resolved
+    ``chat_name``) may set a destination. Unknown keys are dropped for the same
+    reason — the destination is a bounded task-definition field, not a
+    free-form bag.
+    """
+    destination = candidate.notification_destination
+    if not destination:
+        return candidate
+    filtered = {key: value for key, value in destination.items() if key in _KEEP_DESTINATION_KEYS}
+    if filtered == destination:
+        return candidate
+    logger.info(
+        "AI_TASK_TRACE stage=candidate_destination_normalized dropped_keys=%s kept_keys=%s",
+        ",".join(sorted(set(destination) - set(filtered))) or "-",
+        ",".join(sorted(filtered)) or "-",
+    )
+    return replace(candidate, notification_destination=filtered)
+
+
+def _response_shape(value: Any) -> str:
+    """Content-free classification of the provider's raw JSON for diagnostics.
+
+    Lets one live reproduction distinguish null / object / array / string /
+    unsupported-envelope responses WITHOUT logging any content: a single
+    word in the AI_TASK_TRACE candidate_rejected / candidate_parsed lines.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, dict):
+        if set(value) == {"unsupported"} and isinstance(value.get("unsupported"), str):
+            return "unsupported"
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    return f"other:{type(value).__name__}"
+
+
+def _outer_object_span(raw: str) -> tuple[int, int] | None:
+    """Locate the outermost balanced {...} span in prose, string-aware.
+
+    Deterministic character scan (no regex): tracks JSON string literals and
+    escapes so braces INSIDE string values (e.g. inside the verbatim
+    ai_instruction) never confuse the depth counter. Returns None when no
+    balanced object exists.
+    """
+    start = raw.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(raw)):
+        ch = raw[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return (start, i + 1)
+    return None
+
+
+def _classify_response_structure(raw: Any) -> dict[str, Any]:
+    """Content-free structural classification of the raw provider text.
+
+    Parser-independent and never emits response content: only character
+    CLASS categories (object/array/fence/quote/other/empty), booleans, and
+    lengths — safe for one live production reproduction to identify the
+    exact provider-response shape reaching the interpreter.
+    """
+    if not isinstance(raw, str):
+        return {
+            "text_type": type(raw).__name__, "empty": True,
+            "first_non_ws": "empty", "raw_len": 0,
+        }
+    stripped = raw.strip()
+    first = stripped[:1] if stripped else ""
+    if not first:
+        first_cat = "empty"
+    elif first == "{":
+        first_cat = "object"
+    elif first == "[":
+        first_cat = "array"
+    elif stripped.startswith("```"):
+        first_cat = "fence"
+    elif first == '"':
+        first_cat = "quote"
+    else:
+        first_cat = "other"
+    last = stripped[-1:] if stripped else ""
+    return {
+        "text_type": "str",
+        "empty": not stripped,
+        "first_non_ws": first_cat,
+        "starts_fence": stripped.startswith("```"),
+        "contains_fence": "```" in raw,
+        "leading_prose": first_cat in ("other",),
+        "trailing_prose": bool(stripped) and last not in ("}", "]", '"', "`"),
+        "has_control_chars": any(ord(c) < 32 and c not in "\t\n\r" for c in raw) or "\n" in raw or "\r" in raw,
+        "object_span": _outer_object_span(raw) is not None,
+        "raw_len": len(raw),
+    }
+
+
+def _log_response_shape_trace(
+    request_id: str, response: ProviderResponse, meta: dict[str, Any], structure: dict[str, Any],
+) -> None:
+    """One content-free AI_TASK_TRACE record for the raw provider response.
+
+    Emitted BEFORE any parsing/transformation — the observable boundary
+    between the provider mesh and the task interpreter.
+    """
+    finish = meta.get("finish_reason")
+    provider_truncated = (
+        isinstance(finish, str) and finish.upper() in ("MAX_TOKENS", "LENGTH")
+    )
+    logger.warning(
+        "AI_TASK_TRACE request_id=%s stage=raw_response_shape "
+        "provider=%s model=%s success=%s text_type=%s empty=%s "
+        "first_non_ws=%s starts_fence=%s contains_fence=%s "
+        "leading_prose=%s trailing_prose=%s has_control_chars=%s "
+        "object_span=%s raw_len=%s truncated=%s finish_reason=%s "
+        "http_status=%s failure_type=%s",
+        request_id or "-", response.provider_name or "unknown",
+        meta.get("model") or "-", bool(response.success),
+        structure.get("text_type", "-"), bool(structure.get("empty")),
+        structure.get("first_non_ws", "-"),
+        bool(structure.get("starts_fence")), bool(structure.get("contains_fence")),
+        bool(structure.get("leading_prose")), bool(structure.get("trailing_prose")),
+        bool(structure.get("has_control_chars")), bool(structure.get("object_span")),
+        structure.get("raw_len", 0), bool(provider_truncated),
+        finish if isinstance(finish, str) else "-",
+        meta.get("http_status", "-"), meta.get("failure_type", "-"),
+    )
+
+
+def _load_candidate_json(raw: str) -> Any:
+    """Parse the model's JSON, tolerating the wrapper shapes the provider
+    contract legitimately permits.
+
+    The provider adapters deliver the model's output as ONE plain text
+    string (Gemini joins text parts, OpenAI-compat uses message content) and
+    the interpreter prompt does not forbid prose around the object, so the
+    following deterministic tolerances are applied — each one still feeds
+    the FULL candidate validation afterwards, so nothing is weakened:
+
+    1. the entire raw response (control characters like literal newlines in
+       strings accepted via ``strict=False`` — the common multi-line
+       ai_instruction escape failure);
+    2. one markdown-fenced JSON block (with or without the ``json`` tag);
+    3. prose-wrapped UNFENCED JSON ("Here is the JSON: {...}") via a
+       string-aware outer-brace span;
+    4. double-encoded JSON (a JSON string whose content is itself JSON).
+
+    Anything else re-raises the real JSONDecodeError against the raw text so
+    the caller can classify it with the parser's own line/column metadata.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise json.JSONDecodeError("empty response", raw if isinstance(raw, str) else "", 0)
+    try:
+        decoded = json.loads(raw, strict=False)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, (dict, list)):
+        return decoded
+    if isinstance(decoded, str) and decoded.strip():
+        # Double-encoded JSON: the top level is a JSON string whose content
+        # is itself the candidate object. Unwrap exactly one level.
+        try:
+            inner = json.loads(decoded, strict=False)
+        except json.JSONDecodeError:
+            inner = None
+        if isinstance(inner, (dict, list)):
+            return inner
+    match = _JSON_BLOCK_RE.search(raw)
+    if match:
+        try:
+            return json.loads(match.group(1), strict=False)
+        except json.JSONDecodeError:
+            pass
+    span = _outer_object_span(raw)
+    if span is not None:
+        try:
+            return json.loads(raw[span[0]:span[1]], strict=False)
+        except json.JSONDecodeError:
+            pass
+    # Re-parse without tolerance so the raised error is the real
+    # JSONDecodeError for the raw text (with lineno/colno/pos metadata).
+    return json.loads(raw)
+
+
+class TaskInterpreter:
+    """Uses only ProviderManager.chat and returns validated candidate data."""
+
+    # Structured-output request: providers that declare the capability
+    # receive ``response_format`` (OpenAI-compat JSON mode / Gemini JSON
+    # MIME) so the model is constrained to emit valid JSON. Malformed
+    # output from a provider that was asked AND claimed the capability is
+    # the provider contract's failure — reported to the manager through the
+    # ``output_validator`` probe so routing can fail over to another
+    # eligible provider (bounded, no cooldown) instead of ending the
+    # request at the first non-compliant model.
+    _RESPONSE_FORMAT = {"type": "json_object"}
+
+    def __init__(self, provider_manager: Any) -> None:
+        self._providers = provider_manager
+
+    @staticmethod
+    def _valid_structured_output(response: ProviderResponse) -> bool:
+        """Content-free probe: does this response parse as JSON at all?
+
+        Deliberately LOOSE — it only reports whether the model's output
+        satisfies the structured-output CONTRACT (a parseable JSON value).
+        It never validates task-candidate semantics; that remains the
+        interpreter's own full validation, and a JSON that parses but fails
+        the candidate schema is NOT a provider-contract failure (the model
+        answered coherently — the interpretation is at fault). The manager
+        uses this result only to decide bounded failover BEFORE any
+        task/persistence/Telegram side effect.
+        """
+        text = getattr(response, "text", None)
+        if not isinstance(text, str) or not text.strip():
+            return False
+        try:
+            json.loads(text, strict=False)
+        except json.JSONDecodeError:
+            # Known contract-permitted wrappers: fenced block and
+            # prose-wrapped object — the same tolerances the interpreter's
+            # own parser accepts. (Double-encoded JSON needs no special
+            # case: it parses as a JSON string on the happy path above.)
+            # Anything looser is NOT added here: the probe must never become
+            # a repair layer.
+            if "```" in text:
+                match = _JSON_BLOCK_RE.search(text)
+                if match:
+                    try:
+                        json.loads(match.group(1), strict=False)
+                        return True
+                    except json.JSONDecodeError:
+                        return False
+            return _outer_object_span(text) is not None
+        return True
+
+    async def interpret(
+        self,
+        request: str,
+        timezone: str = "",
+        request_id: str = "",
+        *,
+        proactive_authorized: bool = False,
+    ) -> TaskCandidate:
+        started = time.perf_counter()
+        if not isinstance(request, str) or not request.strip() or len(request) > MAX_REQUEST_CHARS:
+            raise TaskInterpretationError("task request is empty or too long")
+        # The caller (create_task) may prove authorization from the OWNER'S
+        # full raw message even when the model distilled this request; the
+        # interpreter also detects on the request text it was given, so every
+        # caller (.task command included) gets the same per-request answer.
+        authorized = bool(proactive_authorized) or has_proactive_authorization(request)
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=interpretation_start mode=provider "
+            "request_len=%s proactive_authorized=%s",
+            request_id or "-", len(request), str(authorized).lower(),
+        )
+        instructions = (
+            "Return exactly one JSON object matching the supplied task candidate schema. "
+            "SEMANTIC INTERPRETATION: interpret the user's INTENT in Persian or English; "
+            "never require exact phrasing, a fixed template, or a specific word order. "
+            "Multi-line requests and colloquial phrasings are normal. A clear action plus "
+            "any recognizable schedule/trigger expression is a valid task — unfamiliar "
+            "wording is not ambiguity. "
+            "NULL RULE: return JSON null ONLY when the message has NO recognizable "
+            "schedule/trigger expression AND no clear action (pure chit-chat). Never "
+            "return null for a clear interval, time, or event phrase just because the "
+            "wording is unusual, the number is written as a word, 'every'/'هر' is omitted, "
+            "or the request spans multiple lines. "
+            "UNSUPPORTED CAPABILITY: if the request is semantically CLEAR but asks for a "
+            "capability this schema cannot express — calendar month/year recurrence "
+            "('هر ماه', 'ماهانه', 'monthly', 'هر سال', 'سالانه', 'yearly', 'every year', "
+            "'اول هر ماه', 'first of month', '15th of month', 'every year on January 1', "
+            "'هر آخر هفته', 'every weekend') — return EXACTLY the single JSON object "
+            "{\"unsupported\": \"<short capability name>\"} and nothing else. Do not "
+            "fabricate seconds for months/years and do not return null for them. "
+            "ACTION OBJECT CONTRACT: every element of 'actions' MUST be an object of the "
+            "exact form {'name': <action name>, 'arguments': <object>} — a 'name' string "
+            "plus an 'arguments' object — and OPTIONALLY one 'not_before' ISO-8601 "
+            "date+time (the earliest instant at which THAT action may run; earlier "
+            "actions still run now). No other keys inside the action object. Add "
+            "'not_before' ONLY when the user asks that a later part of the same "
+            "request happen at a later time; never put it on the first action of a "
+            "request that must start now. Example: "
+            "{'name': 'send_message', 'arguments': {'text': 'hello'}}. For any "
+            "message-writing action (e.g. 'بنویس', 'بفرست', 'write', 'send'), use "
+            "exactly the action name 'send_message' with arguments carrying a single "
+            "bounded 'text' key containing the exact message content; the destination "
+            "is fixed by the runtime and must not be included. Use no other action name "
+            "for message writing. "
+            "PROFILE ACTIONS: for bio/profile updates ('تو بیو بزارش', 'توی بیو بزاری', "
+            "'بیو رو عوض کن', 'بیو پروفایلم رو آپدیت کن', 'update my bio', 'آپدیت کن بیو "
+            "پروفایلم'), use exactly the REGISTERED action "
+            "name 'bio_set_text' with arguments {'text': ''} — EMPTY, because the content is "
+            "AI-generated per occurrence under ai_instruction; never bake a finished sentence "
+            "into the arguments. For first_name/username changes use exactly 'username_set_text' "
+            "with {'text': ''}. Never invent other action names: an action name that is not "
+            "registered is rejected. Keep exactly one action object in 'actions'. "
+            "CONDITIONAL BRANCHES (bounded, at most ONE condition per task): when the "
+            "user asks to do something ONLY IF a result says so ('اگر ... بود ... "
+            "وگرنه ...', 'if ... then ... otherwise ...'), emit 'actions' as: the "
+            "earlier actions, then ONE condition action — exactly "
+            "{\"condition\": {\"source\": {\"action\": <number of an EARLIER action>, "
+            "\"field\": \"<a field that action's tool declares as chainable>\"}, "
+            "\"operator\": \"equals\"|\"not_equals\", \"value\": <text | boolean | "
+            "number | null>}} — then the true-branch actions (each with "
+            "\"branch\": \"true\") and finally the false-branch actions (each with "
+            "\"branch\": \"false\"). Both branches need at least one action, the "
+            "true branch comes first, each branch is one contiguous run, and a "
+            "branch action may only reference results of an earlier action of its "
+            "OWN branch (or of an action before the condition). The condition is "
+            "data, never code and never an expression, and it never decides by "
+            "itself: if the decision needs information no registered action can "
+            "return, return JSON null instead of inventing a field. A conditional "
+            "chain never carries 'ai_instruction' (conditions and per-run generated "
+            "content are not combined). "
+            "NON-INVENTION CONTRACT: schema validity is not semantic completeness. "
+            "Never invent missing schedule, content, source, language, destination, "
+            "recurrence, or generation requirements merely to fill the JSON schema. "
+            "If the user has not supplied enough information for a safe direct task, "
+            "return JSON null so the existing structured Taskloom flow can resolve it. "
+            "For bio_set_text and username_set_text, use empty text ONLY when the "
+            "user explicitly requests generated/per-occurrence content and preserve "
+            "the full request verbatim in ai_instruction. For send_message, include "
+            "only static text the user actually provided; never fabricate message "
+            "content. A schedule expression alone does not authorize invented content. "
+            "\n\n"
+            "AI-GENERATED CONTENT CONTRACT: when the task's content must be generated "
+            "or varied at each run — random dialogues or quotes from a specific "
+            "person/character/source, a fresh bio each time, any request like 'random X "
+            "from Y' or 'change my bio to ...' — DO NOT bake one fixed text into the "
+            "action arguments. Instead keep the content arguments minimal (empty text) "
+            "and add the field 'ai_instruction' at the TOP LEVEL of the candidate with "
+            "the user's request VERBATIM — never paraphrased, never translated, never "
+            "shortened — so the exact source/person/character, language and length "
+            "requirements survive word-for-word; the runtime generates and validates "
+            "the content at each occurrence and rejects unrelated characters. A request "
+            "for 'a dialogue from <X>' must keep '<X>' inside ai_instruction exactly as "
+            "spoken. When you embed the request in 'ai_instruction', escape line breaks "
+            "as \\n inside the JSON string so the JSON stays valid. Only truly static "
+            "one-time content (say exactly 'hello') omits "
+            "ai_instruction. "
+            "SOURCE DISPLAY (default OFF): naming a source/person/character does NOT "
+            "mean its name must appear in the output — the source is a generation "
+            "constraint only, so by default the generated content shows no speaker "
+            "name. Never add a show/hide request the user did not make, and never "
+            "treat the mere presence of a source as a request to display it. When the "
+            "user EXPLICITLY asks for the source/character NAME to be visible (e.g. "
+            "'اسمش هم اولش باشه', 'با اسمش', 'منبع رو نمایش بده', 'show the source "
+            "name', 'with the source name'), keep those exact words in "
+            "ai_instruction. When the user explicitly asks that the name NOT be "
+            "shown (e.g. 'اسمش رو ننویس', 'بدون اسم', 'don't show the source'), keep "
+            "those exact words too. With no such language, the source is never "
+            "displayed. "
+            "SCHEDULE CONTRACT: 'schedule' must match the schedule_type exactly — "
+            "interval: {'seconds': <positive number>} (every X minutes = X*60 seconds, "
+            "e.g. 'هر سه دقیقه' or 'every 3 minutes' = {'seconds': 180}); "
+            "once: {'at': '<naive local ISO datetime>', 'timezone': '<IANA tz>'}; "
+            "daily: {'hour': 0-23, 'minute': 0-59, 'timezone': '<IANA tz>'}; "
+            "weekly: {'weekday': 0-6 (0=Monday), 'hour': 0-23, 'minute': 0-59, "
+            "'timezone': '<IANA tz>'}. Do not put unit names like 'minutes' inside "
+            "the schedule object — convert them to seconds yourself. "
+            "COMPOUND INTERVALS: 'every 1 hour and 30 minutes', 'هر 1 ساعت و 30 دقیقه', "
+            "'هر یک ساعت و نیم' → compute the total yourself ({'seconds': 5400}); you "
+            "may also emit the structured compound form {'hours': 1, 'minutes': 30} — "
+            "the runtime sums the known units. 'هر نیم ساعت' / 'every half hour' = "
+            "{'seconds': 1800}. Never use month or year as a duration unit (see "
+            "UNSUPPORTED CAPABILITY). "
+            "TIME-OF-DAY & CALENDAR TRIGGERS: 'today at 5' / 'امروز ساعت 5' → once at "
+            "today 17:00; 'tomorrow at 8 AM' / 'فردا ساعت 8 صبح' → once tomorrow 08:00; "
+            "'every day at 9' / 'هر روز ساعت 9' / 'روزانه' → daily; 'every night at "
+            "11' / 'هر شب ساعت 11' → daily 23:00; 'every Monday at 10' / 'هر دوشنبه "
+            "ساعت 10' → weekly. WEEKDAY NUMBERS (0=Monday .. 6=Sunday): دوشنبه=0، "
+            "سه‌شنبه=1، چهارشنبه=2، پنجشنبه=3، جمعه=4، شنبه=5، یکشنبه=6؛ English: "
+            "Monday=0 .. Sunday=6. Time-of-day uses the 24-hour clock. Monthly/yearly "
+            "calendar triggers are UNSUPPORTED (see UNSUPPORTED CAPABILITY). "
+            "EVENT SCHEDULES (trigger type): use schedule_type 'event' ONLY when the user "
+            "explicitly asks for an automation that reacts to a Telegram message "
+            "(e.g. 'وقتی جان پیام داد جوابش بده', 'when John sends me a message reply using X', "
+            "'هر وقت از این چت پیام اومد', 'when I receive a message from this chat containing "
+            "urgent'). The schedule must be {'trigger': {'type': 'telegram_message', ...}} with "
+            "the allowed trigger fields: 'sender' (a display NAME such as 'John' or 'علی' — "
+            "never a numeric id), 'chat' (a chat name, or 'this chat'/'همین چت' for the current "
+            "conversation — never a numeric id; channel names work for 'وقتی کانال X پست گذاشت' / "
+            "'when channel X posts' — a channel post arrives as a message in that chat), "
+            "'contains' (list of substrings, all must appear), "
+            "'text_equals', 'starts_with', 'has_media' (boolean — ANY media), 'media_type' "
+            "(one of photo, video, voice, audio, document, sticker, animation — 'عکس'/'photo' "
+            "→ 'photo', 'ویدیو'/'video' → 'video', 'فایل'/'file' → 'document'), 'is_reply' "
+            "(boolean — 'وقتی جواب دادن' / 'when someone replies'), 'is_mention' (boolean — "
+            "'وقتی کسی منو منشن کرد' / 'when someone mentions me'), and "
+            "'direction' ('incoming' default for 'وقتی X بهم پیام داد' / 'when X messages me'; "
+            "'outgoing' for 'وقتی من نوشتم X' / 'when I write X'; 'any'). Include at least one "
+            "condition. Never invent sender/chat ids — the runtime resolves names. "
+            "DO NOT use schedule_type 'event' for time-based requests; those stay once/interval/"
+            "daily/weekly. "
+            "\n\n"
+            "INTERVAL RECOGNITION (semantic — do NOT require one fixed sentence shape): any "
+            "expression of 'every N <unit>', 'once every N <unit>', 'N <unit> once', or Persian "
+            "'هر N <unit>' / 'N <unit> یک بار' / 'N <unit> یه بار' with N written as digits "
+            "(Latin, Persian, or Arabic-Indic) OR a number word (Persian: یک، دو، سه، چهار، "
+            "پنج، شش، هفت، هشت، نه، ده، بیست، سی، شصت / English: one..ten, fifteen, twenty, "
+            "thirty, sixty) and a unit (دقیقه/ساعت/روز/هفته/ثانیه or minute(s)/hour(s)/day(s)/"
+            "week(s)/second(s)) is a CLEAR recurring interval. 'هر پنج دقیقه' and 'every five "
+            "minutes' are exactly as valid as 'هر 5 دقیقه'. Requests may span multiple lines and "
+            "the interval may appear on its own line ('هر ۵ دقیقه' alone) with the action in "
+            "following lines. Convert to {'seconds': N} yourself (5 minutes = 300; 300 seconds = "
+            "300). Only return null when NO schedule expression exists at all — never for a "
+            "clear interval phrase. The words 'هر' (every), 'بار' (time/occasion), 'دقیقه' "
+            "(minute), 'ساعت' (hour), 'روز' (day), 'هفته' (week), 'ماه' (month) together with "
+            "an action verb indicate a recurring task. "
+            "\n\n"
+            "EXPLICIT DESTINATION (optional): If the user specifies a chat name for the destination "
+            "(e.g. 'در OskarBeam بنویس سلام', 'in OskarBeam write hello'), include it in the "
+            "notification_destination as {'chat_name': 'OskarBeam'}. Use the exact chat name as spoken. "
+            "If no chat is specified, the destination is the current chat — set "
+            "notification_destination to {} (empty). Never include numeric chat_ids. "
+            "\n\n"
+            "DESTINATION FLAGS (both optional, both default false): inside notification_destination "
+            "set 'deliver_result': true ONLY when the user asks to see the task's result when it runs "
+            "(e.g. 'show me the latest tasks', 'به من نشون بده', 'نمایش بده') and the action is a "
+            "read/report action (task_list, list_saves, search, ...) — never for message-writing "
+            "actions. Set 'notify_on_outcome': true ONLY when the user explicitly asks to be notified "
+            "when the task runs or fails ('notify me', 'خبرم کن', 'به من اطلاع بده'). Otherwise omit "
+            "both flags: scheduled execution must stay silent by default."
+            "\n\n"
+            "QUESTIONS (bounded; several 'ask_owner' actions are allowed but only ONE is ever "
+            "waiting at a time): when the user asks the task to ASK them something mid-run "
+            "('از من بپرس …', 'ask me …', 'if not enough information, ask me …'), insert an "
+            "action {'name': 'ask_owner', 'arguments': {'question': '<the short question>'}} "
+            "between the actions — one per question the user asked for. Registered actions and "
+            "questions INTERLEAVE freely in the one ordered chain; the workflow stops at "
+            "each question until the owner replies to it, then continues with the NEXT "
+            "already-defined action — the reply fills only the references/branches of "
+            "actions that already exist, it never invents new ones. The question is plain "
+            "text only (≤ 512 chars) — never a destination, ids or code — and a later action "
+            "consumes a question's reply with a reference {'$ref': {'action': <that question's "
+            "action number>, 'field': 'answer'}} (each question's answer is read from ITS OWN "
+            "action number); a condition may read the same field. Never combine "
+            "ask_owner with per-occurrence generated arguments ('ai_instruction')."
+            "\n\n"
+            "EXAMPLE (mirrors the multi-line Persian structure): user writes:\n"
+            "هر ۵ دقیقه\n"
+            "میخوام بیو پروفایلم رو آپدیت کنید\n"
+            "یه دیالوگ رندوم از کاراکتر آیانامی ری از انیمه نئون جنسیس بزاری\n"
+            "که زیر 60 کاراکتر باشه\n"
+            "Return: {\"label\": \"Bio update\", \"schedule_type\": \"interval\", "
+            "\"schedule\": {\"seconds\": 300}, \"timezone\": \"Asia/Tehran\", "
+            "\"actions\": [{\"name\": \"bio_set_text\", \"arguments\": {\"text\": \"\"}}], "
+            "\"notification_destination\": {}, \"ai_instruction\": \"<the user's request "
+            "VERBATIM, including the Persian text exactly as written>\"}."
+        )
+        if isinstance(timezone, str) and timezone.strip():
+            instructions += (
+                f" Use the IANA timezone '{timezone.strip()}' for the candidate's "
+                "TOP-LEVEL 'timezone' field — it is REQUIRED by the schema for every "
+                "schedule type. Only the SCHEDULE OBJECT itself carries no timezone "
+                "field for interval schedules."
+            )
+        if authorized:
+            instructions += " " + PROACTIVE_EXPANSION_INSTRUCTIONS
+        messages = [
+            {"role": "system", "content": instructions},
+            {"role": "system", "content": json.dumps(CANDIDATE_SCHEMA, separators=(",", ":"))},
+            {"role": "user", "content": request.strip()},
+        ]
+        try:
+            response: ProviderResponse = await asyncio.wait_for(
+                self._providers.chat(
+                    messages,
+                    tools=[],
+                    response_format=self._RESPONSE_FORMAT,
+                    output_validator=self._valid_structured_output,
+                ),
+                timeout=INTERPRET_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise TaskInterpretationError("task interpretation provider timed out") from exc
+        except Exception as exc:
+            raise TaskInterpretationError("task interpretation provider failed") from exc
+        if not response.success:
+            # The concrete provider failure (rate limit, model-not-found,
+            # exhausted fallback chain, …) must survive into the raised
+            # error — a generic message here is what previously hid the
+            # root cause from the create_task trace.
+            meta = response.metadata or {}
+            category = (
+                "all_providers_failed" if meta.get("fallback_exhausted")
+                else str(meta.get("failure_type") or meta.get("error_type") or "unknown")
+            )
+            detail = " ".join(str(response.text or "").split())[:200]
+            matrix = meta.get("provider_matrix") or []
+            failed_providers = ",".join(
+                str(entry.get("provider")) for entry in matrix
+                if isinstance(entry, dict) and entry.get("provider")
+            )
+            logger.warning(
+                "AI_TASK_TRACE request_id=%s stage=provider_result success=false "
+                "provider=%s attempted=%s category=%s providers_tried=%s "
+                "fallback_exhausted=%s detail=%s",
+                request_id or "-",
+                response.provider_name or "unknown",
+                failed_providers or response.provider_name or "unknown",
+                category, len(matrix), bool(meta.get("fallback_exhausted")),
+                detail,
+            )
+            raise TaskInterpretationError(
+                f"task interpretation provider failed: provider={response.provider_name} "
+                f"category={category} detail={detail}"
+            )
+        meta = response.metadata or {}
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=provider_result success=true "
+            "provider=%s model=%s fallback=%s latency_ms=%s",
+            request_id or "-", response.provider_name or "unknown",
+            meta.get("model") or "-", bool(meta.get("fallback")),
+            int((time.perf_counter() - started) * 1000),
+        )
+        raw = response.text
+        # Content-free structural instrumentation of the REAL provider
+        # response — emitted before any parsing/transformation. Diagnostics
+        # only: nothing here changes parsing or acceptance behavior.
+        structure = _classify_response_structure(raw)
+        _log_response_shape_trace(request_id, response, meta, structure)
+        if not isinstance(raw, str) or not raw.strip():
+            raise TaskInterpretationError(
+                "task interpretation returned no structured output (empty response)"
+            )
+        value: Any = None
+        shape = "unknown"
+        try:
+            value = _load_candidate_json(raw)
+            shape = _response_shape(value)
+            # Semantically clear but unrepresentable capability: the model
+            # returns {"unsupported": "..."} — surfaced distinctly from
+            # ambiguity so the caller can answer honestly.
+            if (
+                isinstance(value, dict)
+                and set(value) == {"unsupported"}
+                and isinstance(value.get("unsupported"), str)
+                and value["unsupported"].strip()
+            ):
+                raise TaskUnsupportedError(value["unsupported"].strip()[:200])
+            # Provider output is UNTRUSTED: its ai_instruction is grounded to
+            # the original request (or dropped as unauthorized) before the
+            # candidate is validated, so no later creation path can be handed
+            # a model-manufactured generation authorization.
+            if isinstance(value, dict):
+                grounding = ground_ai_instruction(value, request)
+                if grounding:
+                    logger.info(
+                        "AI_TASK_TRACE request_id=%s stage=ai_instruction_grounded reason=%s",
+                        request_id or "-", grounding,
+                    )
+            candidate = parse_candidate_output(value)
+            candidate = _without_untrusted_destination_identifiers(candidate)
+        except TaskUnsupportedError:
+            raise
+        except (json.JSONDecodeError, TaskCandidateError) as exc:
+            if shape == "unknown":
+                shape = "malformed"
+            json_truncated = False
+            if isinstance(exc, json.JSONDecodeError) and isinstance(raw, str):
+                json_truncated = (
+                    "Unterminated" in str(exc)
+                    or (exc.pos >= max(0, len(raw) - 8) and len(raw) >= 20)
+                )
+                finish = meta.get("finish_reason")
+                provider_truncated = (
+                    isinstance(finish, str)
+                    and finish.upper() in ("MAX_TOKENS", "LENGTH")
+                )
+                logger.warning(
+                    "AI_TASK_TRACE request_id=%s stage=candidate_parse_error "
+                    "category=candidate_invalid_json response_shape=malformed "
+                    "provider=%s model=%s json_error=%s line=%s col=%s "
+                    "pos=%s raw_len=%s truncated=%s provider_finish_reason=%s "
+                    "first_non_ws=%s contains_fence=%s leading_prose=%s "
+                    "trailing_prose=%s object_span=%s",
+                    request_id or "-", response.provider_name or "unknown",
+                    meta.get("model") or "-", type(exc).__name__, exc.lineno,
+                    exc.colno, exc.pos, len(raw),
+                    bool(json_truncated or provider_truncated),
+                    finish if isinstance(finish, str) else "-",
+                    structure.get("first_non_ws", "-"),
+                    bool(structure.get("contains_fence")),
+                    bool(structure.get("leading_prose")),
+                    bool(structure.get("trailing_prose")),
+                    bool(structure.get("object_span")),
+                )
+            elif isinstance(value, dict):
+                actions = value.get("actions")
+                logger.info(
+                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
+                    "response_shape=%s reason=%s "
+                    "candidate_type=object action_count=%s "
+                    "action_field_names=%s schedule_type=%s",
+                    request_id or "-", shape, str(exc)[:260],
+                    len(actions) if isinstance(actions, list) else "-",
+                    (",".join(sorted(actions[0])) if isinstance(actions, list) and actions
+                     and isinstance(actions[0], dict) else "-"),
+                    value.get("schedule_type", "-"),
+                )
+            else:
+                logger.info(
+                    "AI_TASK_TRACE request_id=%s stage=candidate_rejected "
+                    "response_shape=%s reason=%s",
+                    request_id or "-", shape, str(exc)[:260],
+                )
+            logger.info(
+                "TASK_INTERPRET_REJECTED reason=candidate_invalid detail=%s",
+                str(exc)[:200],
+            )
+            json_suffix = (
+                f" json_truncated={json_truncated}"
+                if isinstance(exc, json.JSONDecodeError)
+                else ""
+            )
+            raise TaskInterpretationError(
+                f"task interpretation did not return a valid candidate "
+                f"(response_shape={shape}{json_suffix})"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "TASK_INTERPRET_REJECTED reason=candidate_parse_error response_shape=%s detail=%r",
+                shape, exc,
+            )
+            raise TaskInterpretationError("task interpretation did not return a valid candidate") from exc
+        finish = meta.get("finish_reason")
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=candidate_parsed response_shape=%s "
+            "candidate_type=%s "
+            "action_count=%s action_field_names=%s schedule_type=%s timezone=%s "
+            "destination_keys=%s provider_finish_reason=%s",
+            request_id or "-", shape, "object",
+            len(candidate.actions),
+            ",".join(sorted(candidate.actions[0])) if candidate.actions else "-",
+            candidate.schedule_type, candidate.timezone,
+            ",".join(sorted(candidate.notification_destination)) or "-",
+            finish if isinstance(finish, str) else "-",
+        )
+        logger.info(
+            "AI_TASK_TRACE request_id=%s stage=interpretation_end success=true "
+            "schedule_type=%s action_count=%s provider=%s latency_ms=%s",
+            request_id or "-", candidate.schedule_type, len(candidate.actions),
+            response.provider_name or "unknown", int((time.perf_counter() - started) * 1000),
+        )
+        return candidate

@@ -1,0 +1,487 @@
+"""Health tests for the newly connected AI tools.
+
+Covers the task lifecycle capability (task_list, task_inspect,
+task_transition, task_delete) and the saved-item retrieval capability
+(retrieve_save).
+
+Each test drives the REAL chain: ToolRegistry → ToolExecutor (permission
+gate, argument validation) → tool → authoritative existing service
+(TaskManagementService / retrieve_service) → in-memory repository or a
+faked raw-Telegram boundary. No live Telegram, no Supabase, no providers.
+"""
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from backend.ai.tools.context import ToolContext
+from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.registry import create_default_registry
+
+
+OWNER = 777
+CHAT = -100123
+
+
+def _task_data():
+    return {
+        "label": "water reminder",
+        "schedule_type": "interval",
+        "schedule": {"seconds": 60},
+        "timezone": "UTC",
+        "actions": [{"name": "send_message", "arguments": {"text": "hello"}}],
+        "notification_destination": {},
+    }
+
+
+def make_chain(extra: dict | None = None):
+    ctx = ToolContext(
+        telegram=None, owner_id=OWNER, tz_str="UTC",
+        extra={"chat_id": CHAT, "request_id": "connect-audit", **(extra or {})},
+    )
+    registry = create_default_registry(ctx)
+    return registry, ctx, ToolExecutor(registry, ctx)
+
+
+async def run_tool(executor, ctx, name, arguments):
+    results = await executor.execute_calls(
+        [{"name": name, "arguments": arguments}],
+        owner_id=OWNER, session_id="connect-audit", context_override=ctx,
+    )
+    return results[0]
+
+
+# ── task_list ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_list_registered_and_reachable():
+    registry, _ctx, _executor = make_chain()
+    assert registry.has("task_list")
+    tool = registry.get("task_list")
+    assert tool.permission_level.value == "read_only" and tool.safe is True
+
+
+@pytest.mark.asyncio
+async def test_task_list_executor_path_lists_persisted_tasks():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+
+    result = await run_tool(executor, ctx, "task_list", {})
+    assert result.success is True
+    assert f"#{created.id}" in result.message
+    assert "water reminder" in result.message
+
+
+@pytest.mark.asyncio
+async def test_task_list_is_owner_scoped():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(2, _task_data())  # another owner
+
+    result = await run_tool(executor, ctx, "task_list", {})
+    assert result.success is True
+    assert f"#{created.id}" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_task_list_advertises_status_filter_parameter():
+    registry, _ctx, _executor = make_chain()
+    tool = registry.get("task_list")
+    params = tool.parameters
+    assert set(params) == {"status"}
+    assert sorted(params["status"]["enum"]) == ["active", "completed", "paused"]
+
+
+@pytest.mark.asyncio
+async def test_task_list_status_filter_returns_only_matching_status():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+
+    def task_data(label):
+        data = _task_data()
+        data["label"] = label
+        return data
+
+    active_task = await repo.create_task(OWNER, task_data("status-filter-active-beta"))
+    paused_task = await repo.create_task(OWNER, task_data("status-filter-paused-alpha"))
+    assert paused_task.status == "active"
+    paused = await repo.transition_task(
+        OWNER, paused_task.id, "paused", expected_version=paused_task.version
+    )
+    assert paused is not None and paused.status == "paused"
+    assert active_task.status == "active"
+
+    paused_view = await run_tool(executor, ctx, "task_list", {"status": "paused"})
+    assert paused_view.success is True
+    assert "status-filter-paused-alpha" in paused_view.message
+    assert "status-filter-active-beta" not in paused_view.message
+
+    full_view = await run_tool(executor, ctx, "task_list", {})
+    assert full_view.success is True
+    assert "status-filter-paused-alpha" in full_view.message
+    assert "status-filter-active-beta" in full_view.message
+
+
+@pytest.mark.asyncio
+async def test_task_list_rejects_invalid_status_filter_argument():
+    registry, ctx, executor = make_chain()
+    result = await run_tool(executor, ctx, "task_list", {"status": "deleted"})
+    assert result.success is False
+    assert "status" in result.message.lower()
+
+
+# ── task_inspect ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_inspect_registered_and_reachable():
+    registry, _ctx, _executor = make_chain()
+    tool = registry.get("task_inspect")
+    assert tool is not None and tool.permission_level.value == "read_only"
+
+
+@pytest.mark.asyncio
+async def test_task_inspect_executor_path_returns_detail():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+
+    result = await run_tool(executor, ctx, "task_inspect", {"task_id": created.id})
+    assert result.success is True
+    assert "interval" in result.message
+    assert "occurrences" in result.message
+
+
+@pytest.mark.asyncio
+async def test_task_inspect_failure_path_missing_and_invalid():
+    registry, ctx, executor = make_chain()
+    missing = await run_tool(executor, ctx, "task_inspect", {"task_id": 424242})
+    assert missing.success is False and "not found" in missing.message.lower()
+
+    invalid = await run_tool(executor, ctx, "task_inspect", {"task_id": -1})
+    assert invalid.success is False
+
+    no_args = await run_tool(executor, ctx, "task_inspect", {})
+    assert no_args.success is False
+
+
+# ── task_transition ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_transition_registered_and_reachable():
+    registry, _ctx, _executor = make_chain()
+    tool = registry.get("task_transition")
+    assert tool is not None
+    assert tool.permission_level.value == "read_write"
+    assert sorted(tool.parameters["action"]["enum"]) == ["active", "completed", "paused"]
+    # Deleting is a dedicated operation, never a transition status.
+    delete_tool = registry.get("task_delete")
+    assert delete_tool is not None
+    assert delete_tool.permission_level.value == "read_write"
+    # ``query`` addresses a TODO by the owner's own words instead of id+version;
+    # the resolver refuses to pick among several matches.
+    assert sorted(delete_tool.parameters) == ["expected_version", "query", "task_id"]
+    # The list tool's filter enum deliberately stays narrower: a removed
+    # task can never be listed through a status filter.
+    list_tool = registry.get("task_list")
+    assert sorted(list_tool.parameters["status"]["enum"]) == ["active", "completed", "paused"]
+
+
+@pytest.mark.asyncio
+async def test_task_transition_executor_path_pause_resume_complete():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+
+    paused = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "paused", "expected_version": created.version},
+    )
+    assert paused.success is True and paused.data["status"] == "paused"
+    assert paused.data["version"] == created.version + 1
+
+    resumed = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "active", "expected_version": paused.data["version"]},
+    )
+    assert resumed.success is True and resumed.data["status"] == "active"
+
+    completed = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "completed", "expected_version": resumed.data["version"]},
+    )
+    assert completed.success is True and completed.data["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_task_transition_cas_stale_version_fails_honestly():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+
+    stale = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "paused", "expected_version": 999},
+    )
+    assert stale.success is False
+    assert "stale" in stale.message.lower() or "not found" in stale.message.lower()
+    # Task unchanged.
+    current = await repo.get_task(OWNER, created.id)
+    assert current.version == created.version and current.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_task_transition_is_owner_scoped():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    foreign = await repo.create_task(2, _task_data())
+
+    result = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": foreign.id, "action": "paused", "expected_version": foreign.version},
+    )
+    assert result.success is False
+
+
+@pytest.mark.asyncio
+async def test_task_transition_validates_arguments():
+    registry, ctx, executor = make_chain()
+    for bad in (
+        {"task_id": 1, "action": "paused"},                            # missing version
+        {"task_id": 1, "action": "completed", "expected_version": 0}, # non-positive version
+        {"action": "paused", "expected_version": 1},                   # missing id
+        {"task_id": 1, "action": "resumed", "expected_version": 1},   # status outside enum
+    ):
+        result = await run_tool(executor, ctx, "task_transition", bad)
+        assert result.success is False, bad
+
+
+# ── delete (terminal lifecycle state) ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_task_delete_executor_path_removes_the_row():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+    await repo.create_occurrence(
+        OWNER,
+        {
+            "task_id": created.id,
+            "occurrence_key": "2026-09-01T00:00:00+00:00",
+            "definition_version": created.version,
+            "action_snapshot": created.actions,
+            "scheduled_for": "2026-09-01T00:00:00+00:00",
+        },
+    )
+
+    deleted = await run_tool(
+        executor, ctx, "task_delete",
+        {"task_id": created.id, "expected_version": created.version},
+    )
+    assert deleted.success is True
+    assert deleted.data["deleted"] is True and deleted.data["durable"] is True
+
+    # The durable row (and its occurrences) are really gone — not a hidden
+    # "deleted" status.
+    assert await repo.get_task(OWNER, created.id) is None
+    assert await repo.list_occurrences(OWNER, created.id) == []
+
+    listing = await run_tool(executor, ctx, "task_list", {})
+    assert listing.success is True
+    assert f"#{created.id}" not in listing.message
+    inspection = await run_tool(executor, ctx, "task_inspect", {"task_id": created.id})
+    assert inspection.success is False and "not found" in inspection.message
+
+
+@pytest.mark.asyncio
+async def test_removed_task_is_gone_and_cannot_be_reactivated():
+    registry, ctx, executor = make_chain()
+    from backend.ai.database.manager import get_repository_manager
+
+    repo = get_repository_manager().task
+    created = await repo.create_task(OWNER, _task_data())
+    deleted = await run_tool(
+        executor, ctx, "task_delete",
+        {"task_id": created.id, "expected_version": created.version},
+    )
+    assert deleted.success is True
+
+    # There is no "deleted" lifecycle left to reactivate: the row is gone, so
+    # both reactivation and a second delete fail closed.
+    reactivate = await run_tool(
+        executor, ctx, "task_transition",
+        {"task_id": created.id, "action": "active", "expected_version": 1},
+    )
+    assert reactivate.success is False
+    again = await run_tool(
+        executor, ctx, "task_delete",
+        {"task_id": created.id, "expected_version": 1},
+    )
+    assert again.success is False
+
+
+# ── retrieve_save ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_retrieve_save_registered_and_reachable():
+    registry, _ctx, _executor = make_chain()
+    tool = registry.get("retrieve_save")
+    assert tool is not None and tool.permission_level.value == "read_write" and tool.safe is True
+
+
+@pytest.mark.asyncio
+async def test_retrieve_save_executor_path_forwards_through_service():
+    from backend.services import retrieve_service
+
+    class FakeTelegram:
+        def __init__(self):
+            self.client = MagicMock()
+
+    ctx = ToolContext(
+        telegram=FakeTelegram(), owner_id=OWNER, tz_str="UTC",
+        extra={"chat_id": CHAT, "request_id": "connect-audit"},
+    )
+    registry = create_default_registry(ctx)
+    executor = ToolExecutor(registry, ctx)
+
+    with patch.object(
+        retrieve_service, "do_retrieve",
+        AsyncMock(return_value="✅ Retrieved `S0001` to this chat."),
+    ) as svc:
+        result = await run_tool(executor, ctx, "retrieve_save", {"save_code": "s0001"})
+    svc.assert_awaited_once()
+    args = svc.await_args.args
+    # The tool boundary canonicalizes the model's echo to the stored
+    # upper-case code form before the service sees it (service re-normalizes).
+    assert args[1] == OWNER and args[2] == "S0001" and args[3] == CHAT
+    assert result.success is True and "Retrieved" in result.message
+    assert result.data == {"save_code": "S0001", "chat_id": CHAT}
+
+
+@pytest.mark.asyncio
+async def test_retrieve_save_destination_is_trusted_context_not_arguments():
+    """The tool never forwards to a model-chosen destination."""
+    from backend.services import retrieve_service
+
+    class FakeTelegram:
+        def __init__(self):
+            self.client = MagicMock()
+
+    ctx = ToolContext(
+        telegram=FakeTelegram(), owner_id=OWNER, tz_str="UTC",
+        extra={"chat_id": CHAT, "request_id": "connect-audit"},
+    )
+    registry = create_default_registry(ctx)
+    executor = ToolExecutor(registry, ctx)
+
+    with patch.object(
+        retrieve_service, "do_retrieve", AsyncMock(return_value="✅ ok")
+    ) as svc:
+        await run_tool(
+            executor, ctx, "retrieve_save",
+            {"save_code": "S0001", "destination": 999999, "chat_id": 999999},
+        )
+    assert svc.await_args.args[3] == CHAT
+
+
+@pytest.mark.asyncio
+async def test_retrieve_save_failure_paths_are_honest():
+    from backend.services import retrieve_service
+
+    class FakeTelegram:
+        def __init__(self):
+            self.client = MagicMock()
+
+    # No trusted chat in context.
+    ctx_no_chat = ToolContext(
+        telegram=FakeTelegram(), owner_id=OWNER, tz_str="UTC",
+        extra={"request_id": "connect-audit"},
+    )
+    registry1 = create_default_registry(ctx_no_chat)
+    executor1 = ToolExecutor(registry1, ctx_no_chat)
+    result = await run_tool(executor1, ctx_no_chat, "retrieve_save", {"save_code": "S0001"})
+    assert result.success is False and "destination" in result.message.lower()
+
+    # Service failure string propagates as failure.
+    ctx = ToolContext(
+        telegram=FakeTelegram(), owner_id=OWNER, tz_str="UTC",
+        extra={"chat_id": CHAT, "request_id": "connect-audit"},
+    )
+    registry2 = create_default_registry(ctx)
+    executor2 = ToolExecutor(registry2, ctx)
+    with patch.object(
+        retrieve_service, "do_retrieve",
+        AsyncMock(return_value="❌ No item found for `S9999`"),
+    ):
+        failed = await run_tool(executor2, ctx, "retrieve_save", {"save_code": "S9999"})
+    assert failed.success is False and "No item found" in failed.message
+
+    # Missing save code.
+    with patch.object(retrieve_service, "do_retrieve", AsyncMock(return_value="✅ ok")) as svc:
+        no_code = await run_tool(executor2, ctx, "retrieve_save", {})
+    svc.assert_not_awaited()
+    assert no_code.success is False
+
+
+# ── dispatcher/provider-schema integration ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_new_tools_are_provider_schema_visible():
+    registry, _ctx, _executor = make_chain()
+    from backend.ai.engine.dispatcher import Dispatcher
+
+    dispatcher = object.__new__(Dispatcher)
+    dispatcher.set_tool_registry(registry)
+    definitions = Dispatcher._build_tool_definitions(dispatcher)
+    names = {d["function"]["name"] for d in definitions}
+    for expected in ("task_list", "task_inspect", "task_transition", "retrieve_save"):
+        assert expected in names
+
+    task_list = next(d["function"] for d in definitions if d["function"]["name"] == "task_list")
+    task_parameters = task_list["parameters"]
+    assert "status" in task_parameters["properties"]
+    assert "required" not in task_parameters
+
+
+def test_no_duplicate_registrations():
+    registry, _ctx, _executor = make_chain()
+    names = registry.list_names()
+    # The count is a deliberate tripwire: a new tool must be registered ONCE,
+    # and this number is updated together with the tool that changed it — the
+    # basic Todo surface (Part 1), the ordered Todo-step surface (Part 2), and
+    # the durable ask_owner question tool (Part 3D).
+    assert len(names) == len(set(names)) == 55
+    assert "ask_owner" in names
+    for name in ("todo_add", "todo_find", "todo_edit"):
+        assert name in names
+    for name in (
+        "todo_step_add",
+        "todo_step_list",
+        "todo_step_transition",
+        "todo_step_edit",
+        "todo_step_delete",
+    ):
+        assert name in names

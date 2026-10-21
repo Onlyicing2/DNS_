@@ -1,0 +1,623 @@
+"""Task lifecycle tools — wrap ``TaskManagementService``.
+
+The AI can now see and manage the tasks it creates through ``create_task``.
+Every tool is a thin adapter over the SAME authoritative service the ``.task``
+command and Taskloom panel use — no second management system.
+
+Semantics preserved from the existing boundary:
+  - owner-scoped: the service filters every operation by ``owner_id``;
+  - CAS transitions: mutations require the current ``expected_version``, a
+    stale version fails honestly instead of overwriting;
+  - deletion is a REAL row removal (``task_delete`` -> ``delete_task``),
+    never a ``status="deleted"`` lifecycle write;
+  - the tool layer adds NO new persistence or status logic.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from backend.ai.tools.base import PermissionLevel, Tool, ToolResult
+from backend.ai.tools.context import ToolContext
+
+# Statuses the owner can filter the task list by.
+_LIST_STATUSES = ("active", "paused", "completed")
+# Statuses task_transition may move a task to. ``deleted`` is deliberately
+# absent: deletion is the dedicated ``task_delete`` operation (a real row
+# removal), never a status transition.
+_TRANSITION_STATUSES = ("active", "paused", "completed")
+
+
+class TaskListTool(Tool):
+    """List the owner's durable tasks."""
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "task_list"
+
+    @property
+    def description(self) -> str:
+        return (
+            "List the owner's tasks — the basic TODOS and the durable "
+            "scheduled tasks together (id, label, status, next run). Deleted "
+            "tasks are excluded. Optionally filter by status "
+            "(active / paused / completed). Use the returned id and version "
+            "for task_transition / todo_edit / task_delete."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "status": {
+                "type": "string",
+                "enum": list(_LIST_STATUSES),
+                "default": None,
+                "description": "Optional status filter (paused, active, completed).",
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.READ_ONLY
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the task list text in message"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.database.manager import get_repository_manager
+        from backend.ai.task_management import TaskManagementService
+        from backend.ai.task_management_interface import list_text
+
+        status = str(arguments.get("status") or "").strip().lower()
+        if status and status not in _LIST_STATUSES:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Unsupported status filter '{status}'. "
+                    "Allowed: paused, active, completed."
+                ),
+            )
+        try:
+            service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            # ONE authoritative read: the count, the rendered list, and the
+            # degraded marker must all describe the same snapshot. Two reads
+            # could pair a count from one store with content from the other
+            # (and a fallback read could be masked by a later healthy read).
+            snapshot = await service.snapshot(status=status or None)
+            result = await list_text(service, status=status or None, snapshot=snapshot)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Task list failed: {exc}")
+        return ToolResult(
+            success=True,
+            message=result,
+            data={
+                "task_count": len(snapshot.tasks),
+                "task_ids": [int(t.id) for t in snapshot.tasks],
+                "fallback_active": snapshot.fallback_active,
+            },
+        )
+
+
+class TaskInspectTool(Tool):
+    """Inspect one task: schedule, timezone, recent occurrences."""
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "task_inspect"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("task_id",)
+
+    @property
+    def description(self) -> str:
+        return (
+            "Inspect one task by id: label, status, version, schedule, "
+            "timezone, and recent occurrences. A TODO instead reports its "
+            "ordered steps: how many are completed, the numbered list and "
+            "which step is next."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "task_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task id (from task_list or create_task).",
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        return PermissionLevel.READ_ONLY
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the task detail text in message"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.database.manager import get_repository_manager
+        from backend.ai.task_management import TaskManagementService
+        from backend.ai.task_management_interface import inspect_text
+
+        task_id = _coerce_positive_int(arguments.get("task_id"))
+        if task_id is None:
+            return ToolResult(success=False, message="A positive task_id is required.")
+        try:
+            service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            # A todo reports what a todo really has: its step progress. The
+            # scheduled-task rendering below is unchanged.
+            todo = await service.owner_todo(task_id)
+            if todo is not None:
+                from backend.ai.task_management import step_progress_of
+                from backend.ai.task_management_interface import (
+                    steps_block_text,
+                    todo_detail_text,
+                )
+
+                steps = list(await service.list_steps(todo.id) or [])
+                progress = step_progress_of(steps)
+                message = (
+                    f"{todo_detail_text(todo, progress)}\n\n"
+                    f"{steps_block_text(todo, steps, progress)}"
+                )
+                return ToolResult(
+                    success=True,
+                    message=message,
+                    data={
+                        "task_id": int(todo.id),
+                        "title": str(todo.label),
+                        "status": str(todo.status),
+                        "version": int(todo.version),
+                        "steps_total": int(progress.total),
+                        "steps_completed": int(progress.completed),
+                        "steps_remaining": int(progress.remaining),
+                    },
+                )
+            result = await inspect_text(service, task_id)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Task inspect failed: {exc}")
+        if result == "Task not found.":
+            return ToolResult(success=False, message=f"Task #{task_id} not found.")
+        return ToolResult(success=True, message=result)
+
+
+class TaskTransitionTool(Tool):
+    """Pause / resume / complete / reopen a task (owner-scoped, CAS check).
+
+    Reopening (``action="active"`` on a COMPLETED todo) is the Todo
+    lifecycle's other half; the service restricts it to a todo, so a
+    completed scheduled task stays terminal. A todo may also be addressed by
+    a title reference (``query``) instead of id+version: the SAME
+    deterministic resolver the Todo surface uses then decides 0/1/N, and an
+    ambiguous reference is answered with the candidate list — never a guess.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "task_transition"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("task_id", "expected_version")
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        # ``action`` (native tool calls) and ``action_status`` (JSON action
+        # field name) are the two accepted spellings of the target status.
+        return ("action", "action_status")
+
+    @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Provider schema requires only the target status.
+
+        The execution/durability contract also needs task_id+expected_version
+        OR a title reference (``query``); a flat JSON-Schema ``required`` list
+        cannot express that disjunction, so the addressing fields stay
+        optional in the schema and the description names both valid shapes.
+        """
+        return ("action",)
+
+    @property
+    def description(self) -> str:
+        return (
+            "Change a task's status: pause, resume (set active), complete, "
+            "or — for a TODO — reopen a completed todo by setting it active "
+            "again. Requires the task's CURRENT version (from task_list, "
+            "task_inspect or todo_find) — a stale version fails and nothing "
+            "changes. A todo may instead be addressed by a title reference "
+            "(query), which resolves only when exactly one todo matches. "
+            "A todo that still has steps cannot be completed with "
+            "action='completed' alone: either finish those steps first, or pass "
+            "complete_steps=true to complete the todo TOGETHER with the steps "
+            "it still has. Use task_delete to remove a task permanently."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "task_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task id to transition.",
+            },
+            "action": {
+                "type": "string",
+                "enum": list(_TRANSITION_STATUSES),
+                "description": "Target status: paused, active (resume), or completed.",
+            },
+            "expected_version": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task's current version (optimistic concurrency).",
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Instead of task_id/expected_version, for a TODO: the "
+                    "owner's own title reference; it resolves only when "
+                    "exactly one todo matches."
+                ),
+            },
+            "complete_steps": {
+                "type": "boolean",
+                "description": (
+                    "For a TODO completed with action='completed': also complete "
+                    "the steps it still has, so the todo is never reported as "
+                    "finished while one of its steps remains. Never completes a "
+                    "todo silently — without it the request is refused and names "
+                    "what is left."
+                ),
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        # Pausing/resuming/completing the owner's own task is a benign,
+        # owner-authorized lifecycle operation; the CAS version check keeps
+        # it deterministic and stale-safe.
+        return PermissionLevel.READ_WRITE
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the new task id/status/version in message and data"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.database.manager import get_repository_manager
+        from backend.ai.task_management import TaskManagementService
+
+        task_id = _coerce_positive_int(arguments.get("task_id"))
+        version = _coerce_positive_int(arguments.get("expected_version"))
+        # ``action_status`` is the JSON-action field name; native tool calls use
+        # ``action``. Both names resolve here so one request shape is never
+        # silently rejected as "unsupported status" on the fallback path.
+        status = str(arguments.get("action") or arguments.get("action_status") or "").strip().lower()
+        resolved_by_title = bool(str(arguments.get("query") or "").strip())
+        if resolved_by_title:
+            # A todo addressed by the owner's own words: the deterministic
+            # resolver (0/1/N) decides which todo, and the version it just
+            # read is the CAS version used below. An ambiguous reference never
+            # reaches a mutation.
+            from backend.ai.tools.todo_tools import resolve_todo_argument
+
+            task, failure = await resolve_todo_argument(
+                context.owner_id, arguments, require_version=False
+            )
+            if failure is not None:
+                return failure
+            task_id, version = int(task.id), int(task.version)
+        if task_id is None:
+            return ToolResult(success=False, message="A positive task_id is required.")
+        if version is None:
+            return ToolResult(
+                success=False,
+                message=(
+                    "The task's current version is required (from task_list, "
+                    "task_inspect or todo_find). Nothing was changed."
+                ),
+            )
+        if status not in _TRANSITION_STATUSES:
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Unsupported status '{status}'. "
+                    "Allowed: paused, active, completed. Use task_delete to "
+                    "remove a task."
+                ),
+            )
+
+        complete_steps = bool(arguments.get("complete_steps"))
+        service = None
+        prior_status = ""
+        try:
+            service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            if status == "active":
+                # Only the active target can be a REOPEN (completed -> active),
+                # so the read that tells the two apart happens here and not on
+                # every transition.
+                prior = await service.repository.get_task(service.owner_id, task_id)
+                prior_status = str(getattr(prior, "status", "") or "")
+            if status == "completed" and complete_steps:
+                # The ONE operation that finishes a todo AND the steps it still
+                # has; plain completion stays refused while a step remains.
+                task = await service.complete_todo_with_steps(task_id, version)
+            else:
+                task = await service.set_status(task_id, status, expected_version=version)
+        except ValueError as exc:
+            # A refusal the owner must read ("a todo is completed or reopened, "
+            # never paused" / "Todo #12 is not complete: 2 of 3 steps remain").
+            return ToolResult(success=False, message=str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Task transition failed: {exc}")
+        if task is None:
+            # A stale version is the common first-message failure: the owner
+            # asked to pause a task the model had read in an earlier round.
+            # Report the CURRENT version so the very next round can retry
+            # deterministically instead of guessing or giving up.
+            current = await service.repository.get_task(service.owner_id, task_id)
+            if current is not None:
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"Task #{task_id} was not changed: version {version} is "
+                        f"stale (it is now v{current.version}). Retry with "
+                        f"expected_version={current.version}."
+                    ),
+                    data={"task_id": int(task_id), "current_version": int(current.version)},
+                )
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Task #{task_id} not found or ownership check failed. "
+                    "Nothing was changed."
+                ),
+            )
+        _STATUS_VERB = {
+            "paused": "paused",
+            "active": "reopened" if prior_status == "completed" else "resumed",
+            "completed": "completed",
+        }
+        message = (
+            f"✅ Task #{task.id} "
+            f"{_STATUS_VERB.get(str(task.status), 'is now ' + str(task.status))} "
+            f"· version {task.version}."
+        )
+        data = {
+            "task_id": int(task.id),
+            "status": str(task.status),
+            "version": int(task.version),
+        }
+        # A degraded write is NOT a durable write — mirror the create path:
+        # the transition still succeeds through the shared in-memory fallback,
+        # but the owner must never be told the change is persisted when the
+        # durable store never received it (a later healthy read or a restart
+        # reverts it). The repository annotates the record via
+        # _annotate_fallback exactly when its Supabase update degraded.
+        fallback_backend = str(getattr(task, "fallback_backend", "") or "")
+        if fallback_backend:
+            from backend.ai.task_management_interface import fallback_note
+
+            fallback_reason = str(getattr(task, "fallback_reason", "") or "")
+            message = f"{message}\n\n{fallback_note(fallback_reason)}"
+            data["durable"] = False
+            data["fallback_backend"] = fallback_backend
+            data["fallback_reason"] = fallback_reason
+        else:
+            data["durable"] = True
+        return ToolResult(success=True, message=message, data=data)
+
+
+class TaskDeleteTool(Tool):
+    """Permanently delete one task (owner-scoped, CAS version check).
+
+    Deletion is a real repository removal — never a ``status="deleted"``
+    lifecycle write — so the task leaves every list because its ``ai_tasks``
+    row (with its occurrences) is gone. A stale ``expected_version`` fails and
+    nothing changes. A deletion that degraded into the in-memory fallback is
+    still reported honestly as non-durable.
+    """
+
+    def __init__(self, context: ToolContext) -> None:
+        self._context = context
+
+    @property
+    def name(self) -> str:
+        return "task_delete"
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        return ("task_id", "expected_version")
+
+    @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Provider schema requires no single argument.
+
+        Deletion is addressed by task_id+expected_version OR by a title
+        reference (``query``); neither alternative is mandatory for every
+        valid call, and a flat ``required`` list cannot express the choice.
+        """
+        return ()
+
+    @property
+    def description(self) -> str:
+        return (
+            "Permanently delete a task by id (a todo too). Requires the "
+            "task's CURRENT version (from task_list, task_inspect or "
+            "todo_find) — a stale version fails and nothing changes. A TODO "
+            "may instead be addressed by a title reference (query), which "
+            "resolves only when exactly one todo matches. The task is really "
+            "removed and disappears from the task list."
+        )
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        return {
+            "task_id": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task id to delete.",
+            },
+            "expected_version": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "The task's current version (optimistic concurrency).",
+            },
+            "query": {
+                "type": "string",
+                "description": (
+                    "Instead of task_id/expected_version, for a TODO: the "
+                    "owner's own title reference; it resolves only when "
+                    "exactly one todo matches."
+                ),
+            },
+        }
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        # Deleting the owner's own task is an owner-authorized lifecycle
+        # operation; the CAS version check keeps it deterministic and
+        # stale-safe.
+        return PermissionLevel.READ_WRITE
+
+    @property
+    def safe(self) -> bool:
+        return True
+
+    @property
+    def return_type(self) -> str:
+        return "ToolResult with the deleted task id and its durability in data"
+
+    async def execute(self, context: ToolContext, arguments: dict[str, Any]) -> ToolResult:
+        from backend.ai.database.manager import get_repository_manager
+        from backend.ai.database.task_repository import DELETION_STALE
+        from backend.ai.task_management import TaskManagementService
+
+        task_id = _coerce_positive_int(arguments.get("task_id"))
+        version = _coerce_positive_int(arguments.get("expected_version"))
+        if str(arguments.get("query") or "").strip():
+            # A todo addressed by the owner's own words: the deterministic
+            # resolver (0/1/N) decides which todo, and the version it just
+            # read is the CAS version used below. An ambiguous reference never
+            # reaches a deletion.
+            from backend.ai.tools.todo_tools import resolve_todo_argument
+
+            task, failure = await resolve_todo_argument(
+                context.owner_id, arguments, require_version=False
+            )
+            if failure is not None:
+                return failure
+            task_id, version = int(task.id), int(task.version)
+        if task_id is None:
+            return ToolResult(success=False, message="A positive task_id is required.")
+        if version is None:
+            return ToolResult(
+                success=False,
+                message=(
+                    "The task's current version is required (from task_list, "
+                    "task_inspect or todo_find). Nothing was changed."
+                ),
+            )
+
+        try:
+            service = TaskManagementService(get_repository_manager().task, context.owner_id)
+            result = await service.delete(task_id, expected_version=version)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(success=False, message=f"Task delete failed: {exc}")
+
+        if not result.deleted:
+            if result.fallback_backend:
+                # The durable store could not be reached: nothing durable was
+                # verified, so a deletion success must never be claimed. The
+                # attribution stays truthful — a local resource error is not
+                # a Supabase outage.
+                from backend.ai.database.task_repository import FALLBACK_REASON_LOCAL_RESOURCE
+
+                cause = (
+                    "a local resource error prevented reaching the durable store"
+                    if getattr(result, "fallback_reason", "") == FALLBACK_REASON_LOCAL_RESOURCE
+                    else "the durable store was unreachable"
+                )
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"⚠️ Task #{task_id} was not deleted: {cause} and the "
+                        "in-memory fallback holds no matching task. Nothing "
+                        "durable was changed."
+                    ),
+                )
+            if result.outcome == DELETION_STALE:
+                current = await service.repository.get_task(service.owner_id, task_id)
+                current_version = getattr(current, "version", None)
+                detail = (
+                    f"it is now v{current_version}"
+                    if isinstance(current_version, int)
+                    else "the task changed after you read it"
+                )
+                data: dict[str, Any] = {"task_id": int(task_id), "deleted": False}
+                if isinstance(current_version, int):
+                    data["current_version"] = current_version
+                return ToolResult(
+                    success=False,
+                    message=(
+                        f"Task #{task_id} was not deleted: version {version} is "
+                        f"stale ({detail}). Retry with the current version."
+                    ),
+                    data=data,
+                )
+            return ToolResult(
+                success=False,
+                message=(
+                    f"Task #{task_id} not found, ownership check failed, or it "
+                    "no longer exists. Nothing was changed."
+                ),
+            )
+
+        data: dict[str, Any] = {
+            "task_id": int(task_id),
+            "deleted": True,
+            "durable": bool(result.durable),
+        }
+        message = f"🗑 Task #{task_id} deleted."
+        if not result.durable:
+            # A degraded deletion is NOT durable: the shared in-memory
+            # fallback lost the row, but the durable store still holds it (a
+            # restart or a healthy read would bring it back). Never report it
+            # as a plain deletion success.
+            from backend.ai.task_management_interface import fallback_note
+
+            fallback_reason = str(getattr(result, "fallback_reason", "") or "")
+            message = f"{message}\n\n{fallback_note(fallback_reason)}"
+            data["fallback_backend"] = str(result.fallback_backend)
+            data["fallback_reason"] = fallback_reason
+        return ToolResult(success=True, message=message, data=data)
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    from backend.ai.persian import coerce_int
+
+    number = coerce_int(value)
+    if number is None or number <= 0:
+        return None
+    return number

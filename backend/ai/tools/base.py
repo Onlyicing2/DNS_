@@ -1,0 +1,285 @@
+"""
+Tool base contract — the deterministic bridge between AI and the Self-Bot.
+
+Every tool is a thin wrapper around an existing service function. The AI
+never imports services directly; it calls tools. Tools never contain
+business logic — they delegate to services.
+
+This module defines:
+  - ``PermissionLevel``  — safety classification for tools
+  - ``ToolResult``       — the structured return value of every tool
+  - ``Tool``             — the abstract base class every tool inherits
+
+The ``Tool`` contract (from AI_MASTER_DESIGN.md §6.1):
+
+    name: str              # unique identifier
+    description: str      # what it does (shown to the model)
+    parameters: dict       # JSON schema for arguments
+    permission_level: str # safety classification
+    safe: bool             # safe / dangerous shorthand
+    return_type: str       # description of the return data shape
+
+    async def execute(self, context, arguments) -> ToolResult
+
+Adding a new tool takes under five minutes:
+
+    1. Create a class inheriting from ``Tool``.
+    2. Set the metadata fields (name, description, etc.).
+    3. Implement ``execute(context, arguments)`` — call the existing
+       service function and wrap its return value in a ``ToolResult``.
+    4. Register it in ``registry.create_default_registry()``.
+
+No other file needs to change. The Prompt Builder picks up tools from
+the registry automatically.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Protocol, runtime_checkable
+
+
+class PermissionLevel(str, Enum):
+    """Safety classification for tools.
+
+    The ToolExecutor — the sole caller of ``tool.execute()`` — applies this
+    before executing. In this single-owner self-bot the owner's outgoing
+    message IS the authorization, so:
+
+      - READ_ONLY / READ_WRITE / DANGEROUS → execute directly. DANGEROUS
+        is NOT held behind an extra confirmation round-trip; its destructive
+        effect is bounded deterministically inside the tool/service itself
+        (e.g. deletes re-fetch every ID and enforce outgoing-only).
+      - ADMIN_ONLY            → never auto-executed; the Dispatcher must
+        surface an owner confirmation and re-issue the stored call via
+        ``ToolExecutor.execute_confirmed()``.
+      - CONFIRMATION_REQUIRED → same confirmation gate regardless of the
+        tool's base level.
+    """
+    READ_ONLY = "read_only"
+    READ_WRITE = "read_write"
+    DANGEROUS = "dangerous"
+    ADMIN_ONLY = "admin_only"
+    CONFIRMATION_REQUIRED = "confirmation_required"
+
+
+@dataclass(frozen=True)
+class ToolResult:
+    """Structured result returned by every tool execution.
+
+    Attributes:
+        success:  Whether the action completed without error.
+        message:  Human-readable result text (for the AI to relay).
+        data:      Optional structured payload for the AI to reason over.
+    """
+    success: bool
+    message: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+# Service-layer failure prefixes. Services communicate failures as
+# "❌ ..." / "⚠️ ..." result strings instead of raising. Tools must
+# derive ``success`` from these prefixes — a service returning a string
+# is NOT proof the operation succeeded.
+_SERVICE_FAILURE_PREFIXES = ("❌", "⚠️", "🚫")
+
+
+def result_from_service(result: str, *, data: dict[str, Any] | None = None) -> ToolResult:
+    """Wrap a service-layer result string, deriving success from the outcome.
+
+    Services communicate failures as "❌ ..." / "⚠️ ..." strings. A tool
+    that merely returned without raising must never report success: the AI
+    answers from the REAL result, so failures are surfaced as
+    ``success=False`` with the actual service message.
+    """
+    text = str(result)
+    failed = text.startswith(_SERVICE_FAILURE_PREFIXES)
+    return ToolResult(success=not failed, message=text, data=data or {})
+
+
+@runtime_checkable
+class Tool(Protocol):
+    """The contract every tool must implement.
+
+    Tools are stateless wrappers. They receive a ``ToolContext`` (which
+carries the Telethon client, owner ID, and timezone) and a dict of
+arguments (matching the tool's parameter schema). They delegate to
+the existing service layer and return a ``ToolResult``.
+
+    Tools MUST NOT:
+      - Import or use global state.
+      - Hold references to the client beyond a single execute call.
+      - Re-implement logic that already lives in a service.
+      - Send Telegram messages directly (use the service layer).
+    """
+
+    @property
+    def name(self) -> str:
+        """Globally unique tool identifier (e.g. ``"save"``)."""
+        ...
+
+    @property
+    def description(self) -> str:
+        """Short description shown to the AI model in the prompt."""
+        ...
+
+    @property
+    def parameters(self) -> dict[str, Any]:
+        """JSON-schema-style dict describing the expected arguments."""
+        ...
+
+    @property
+    def permission_level(self) -> PermissionLevel:
+        """Safety classification — determines if AI can call autonomously."""
+        ...
+
+    @property
+    def safe(self) -> bool:
+        """Shorthand: True if permission_level is READ_ONLY or READ_WRITE."""
+        ...
+
+    @property
+    def return_type(self) -> str:
+        """Human-readable description of the structured data shape."""
+        ...
+
+    @property
+    def long_running(self) -> bool:
+        """True if the tool may legitimately run beyond the generic tool timeout.
+
+        Deep Save (media download + re-upload) is the canonical example: large
+        transfers must not be cancelled by the generic short tool timeout.
+        Defaults to False for normal tools.
+        """
+        ...
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        """Argument names whose absence makes this tool unable to run.
+
+        Optional declaration — tools with no required arguments omit it. It is
+        consumed by the durable-task creation boundary (which may store an
+        action whose ToolExecutor call happens later, with no owner present),
+        so it must mirror exactly what ``execute()`` rejects. Never declare an
+        optional argument here.
+        """
+        ...
+
+    @property
+    def provider_required_arguments(self) -> tuple[str, ...]:
+        """Argument names the PROVIDER schema marks required (optional).
+
+        Defaults to ``required_arguments``. A tool whose ``execute()`` accepts
+        ALTERNATIVE argument shapes overrides this to name only what every
+        valid call must carry: a flat JSON-Schema ``required`` list cannot
+        express a disjunction ("address by id+version OR by title
+        reference"), and advertising one alternative as mandatory misdirects
+        the model into supplying the other shape's fields. The tool's own
+        validation still accepts every valid shape — this declaration only
+        shapes what the provider schema reports.
+        """
+        ...
+
+    @property
+    def required_any_arguments(self) -> tuple[str, ...]:
+        """Argument names of which at least ONE must be present (optional).
+
+        For tools whose contract accepts several alternative argument shapes
+        (e.g. a deletion scope given by count OR mode OR a filter).
+        """
+        ...
+
+    @property
+    def requires_reply_context(self) -> bool:
+        """True when ``execute()`` fundamentally needs the replied message.
+
+        Such a tool reads the current turn's ``ToolContext.extra["reply_msg"]``,
+        which a scheduled occurrence never carries. Optional — defaults to
+        False.
+        """
+        ...
+
+    @property
+    def consumable_output_fields(self) -> tuple[str, ...]:
+        """``ToolResult.data`` keys a LATER action may reference (optional).
+
+        Durable action chains consume a previous action's result through an
+        explicit, bounded reference (see ``backend.ai.task_contract``), and a
+        reference may only name a field the tool DECLARES here. Declare only
+        stable identities the tool really returns (e.g. ``save_code``); a
+        declared field whose value is missing, blank or beyond the bounded
+        text size is simply absent from the recorded output, and a reference
+        to it fails the referencing action closed. Omit the property when the
+        tool returns no chainable value.
+        """
+        ...
+
+    async def execute(self, context: "ToolContext", arguments: dict[str, Any]) -> ToolResult:
+        """Perform the action and return a structured result.
+
+        Args:
+            context:   Injected runtime context (client, owner_id, tz_str).
+            arguments: Parsed arguments matching the tool's parameter schema.
+        """
+        ...
+
+
+def requires_owner_confirmation(tool: Tool) -> bool:
+    """True when the ToolExecutor refuses to auto-execute ``tool``.
+
+    ADMIN_ONLY and CONFIRMATION_REQUIRED tools only ever run through the
+    Dispatcher's explicit owner-confirmation round-trip
+    (``ToolExecutor.execute_confirmed``). A scheduled occurrence calls
+    ``execute_calls(confirmed=False)`` and can never supply that approval, so
+    this single predicate is the one authority both the executor and the
+    task-creation eligibility boundary consult.
+    """
+    return tool.permission_level in (
+        PermissionLevel.ADMIN_ONLY,
+        PermissionLevel.CONFIRMATION_REQUIRED,
+    )
+
+
+def declared_required_arguments(tool: Tool) -> tuple[str, ...]:
+    """The argument names ``tool`` declares as required (empty by default)."""
+    declared = getattr(tool, "required_arguments", ()) or ()
+    return tuple(str(name) for name in declared)
+
+
+def declared_any_arguments(tool: Tool) -> tuple[str, ...]:
+    """The alternative argument names ``tool`` declares (at least one)."""
+    declared = getattr(tool, "required_any_arguments", ()) or ()
+    return tuple(str(name) for name in declared)
+
+
+def declared_provider_required_arguments(tool: Tool) -> tuple[str, ...]:
+    """The argument names the PROVIDER schema marks required for ``tool``.
+
+    Reads ``provider_required_arguments`` when the tool declares it, else the
+    tool's execution contract (``required_arguments``). The provider schema
+    must be built from this declaration and NEVER inferred from the presence
+    or absence of a ``default``: a default is a JSON-Schema annotation, not a
+    statement of requiredness, and optional parameters advertised as required
+    made the model fabricate placeholders for metadata its instructions
+    forbade it to invent.
+    """
+    declared = getattr(tool, "provider_required_arguments", None)
+    if declared is None:
+        return declared_required_arguments(tool)
+    return tuple(str(name) for name in declared)
+
+
+def requires_reply_context(tool: Tool) -> bool:
+    """True when ``tool`` declares an immediate replied-message dependency."""
+    return bool(getattr(tool, "requires_reply_context", False))
+
+
+def declared_consumable_output_fields(tool: Tool) -> tuple[str, ...]:
+    """The ``data`` keys ``tool`` declares as chainable (empty by default).
+
+    The single source of truth both the task-creation reference validation and
+    the execution-time output extraction read, so a tool's chainable contract
+    cannot drift between the two boundaries.
+    """
+    declared = getattr(tool, "consumable_output_fields", ()) or ()
+    return tuple(str(name) for name in declared)

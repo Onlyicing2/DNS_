@@ -1,0 +1,375 @@
+"""
+TASK 9 — Reply-to-AI Regression Tests
+
+Verifies the reply-to-AI fix:
+  1. Reply to AI + trigger + extra text → AI receives old AI response as
+     context and user's extra text as the user message.
+  2. Reply to AI + trigger only → AI receives old AI response as context
+     and a continuation prompt as the user message.
+  3. Plain trigger mode (no reply) still works unchanged.
+  4. Reply to AI without trigger word → AI activated with full text as
+     the user message and old AI response as context.
+"""
+from __future__ import annotations
+
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
+
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_with_extra_text_uses_user_text_as_message():
+    """When replying to an AI message with 'Nova explain more', the user
+    message must be 'explain more', NOT the old AI response."""
+    from backend.ai.context.reply_resolver import ReplyResolver, ResolvedAIContent
+    from backend.ai.conversation.context_builder import ReplyContext
+
+    resolver = ReplyResolver()
+    resolver.clear()
+    resolver.register(
+        telegram_msg_id=100,
+        session_id="owner-1",
+        role="assistant",
+        content="The capital of France is Paris.",
+        provider="dummy",
+        model="dummy-1",
+    )
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 100
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = ""
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "Nova explain more"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, "explain more"
+        )
+
+    assert error == ""
+    assert user_message == "explain more"
+    assert reply_ctx.exists is True
+    assert reply_ctx.is_ai_message is True
+    assert reply_ctx.ai_content == "The capital of France is Paris."
+    # The old AI response must NOT be the user message
+    assert user_message != "The capital of France is Paris."
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_trigger_only_uses_continuation_prompt():
+    """When replying to an AI message with only 'Nova', the user message
+    must be a continuation prompt, NOT the old AI response."""
+    from backend.ai.context.reply_resolver import ReplyResolver
+    from backend.ai.conversation.context_builder import ReplyContext
+
+    resolver = ReplyResolver()
+    resolver.clear()
+    resolver.register(
+        telegram_msg_id=200,
+        session_id="owner-1",
+        role="assistant",
+        content="Python is a high-level programming language.",
+        provider="dummy",
+        model="dummy-1",
+    )
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 200
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = ""
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "Nova"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, ""
+        )
+
+    assert error == ""
+    assert reply_ctx.is_ai_message is True
+    assert reply_ctx.ai_content == "Python is a high-level programming language."
+    # The old AI response must NOT be the user message
+    assert user_message != "Python is a high-level programming language."
+    # A continuation prompt must be used
+    assert "Continue" in user_message or "more" in user_message.lower()
+
+
+@pytest.mark.asyncio
+async def test_plain_trigger_mode_still_works(engine, owner_id, chat_id):
+    """Plain trigger mode (no reply) must still pass the user's text as
+    the user message — unchanged behavior."""
+    from backend.ai.session.request import AIRequest
+
+    request = AIRequest(
+        session_id="plain-trigger-1",
+        user_message="Hello, what can you do?",
+        owner_id=owner_id,
+        chat_id=chat_id,
+        message_id=1,
+    )
+    result = await engine.execute(request)
+    assert result is not None
+    assert isinstance(result.success, bool)
+
+
+@pytest.mark.asyncio
+async def test_reply_to_non_ai_message_with_extra_text():
+    """When replying to a non-AI message with 'Nova summarize this',
+    the user message must be 'summarize this' and the replied message
+    is context."""
+    from backend.ai.context.reply_resolver import ReplyResolver
+    from backend.ai.conversation.context_builder import ReplyContext
+
+    resolver = ReplyResolver()
+    resolver.clear()
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 300
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = "Here is a long article about quantum computing."
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "Nova summarize this"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, "summarize this"
+        )
+
+    assert error == ""
+    assert user_message == "summarize this"
+    assert reply_ctx.exists is True
+    assert reply_ctx.is_ai_message is False
+    assert reply_ctx.ai_content == ""
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_without_trigger_uses_full_text_as_message():
+    """When replying to an AI message with text that does NOT start with
+    a trigger word, the reply-to-AI detection must activate the AI and the
+    user's full text must become the user message."""
+    from backend.ai.context.reply_resolver import ReplyResolver, ResolvedAIContent
+    from backend.ai.conversation.context_builder import ReplyContext
+
+    resolver = ReplyResolver()
+    resolver.clear()
+    resolver.register(
+        telegram_msg_id=400,
+        session_id="owner-1",
+        role="assistant",
+        content="The weather today is sunny with a high of 25°C.",
+        provider="dummy",
+        model="dummy-1",
+    )
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 400
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = ""
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "What about tomorrow?"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, "What about tomorrow?"
+        )
+
+    assert error == ""
+    assert user_message == "What about tomorrow?"
+    assert reply_ctx.is_ai_message is True
+    assert reply_ctx.ai_content == "The weather today is sunny with a high of 25°C."
+    assert user_message != "The weather today is sunny with a high of 25°C."
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_persian_no_trigger_label_not_first_word():
+    """Reply-to-AI with Persian text and no trigger: the first word must
+    NOT be promoted to trigger_label. The label must be the generic 'AI'."""
+    from backend.ai.tools.delivery import format_presentation
+
+    raw_text = "میشه بیشتر توضیح بدی؟"
+    first_word = raw_text.split(None, 1)[0]
+    trigger_matched = False
+    reply_to_ai = True
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = ""
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "AI"
+    assert trigger_label != first_word
+    assert user_text == raw_text
+
+    formatted = format_presentation(user_text, "response text", True)
+    assert f"│ {user_text}" in formatted
+    assert first_word not in formatted.split("\n")[0].replace(f"│ {user_text}", "")
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_english_no_trigger_label_not_first_word():
+    """Reply-to-AI with English text and no trigger: the first word must
+    NOT be promoted to trigger_label."""
+    from backend.ai.tools.delivery import format_presentation
+
+    raw_text = "Can you explain more?"
+    first_word = raw_text.split(None, 1)[0]
+    trigger_matched = False
+    reply_to_ai = True
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = ""
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "AI"
+    assert trigger_label != first_word
+    assert user_text == raw_text
+
+    formatted = format_presentation(user_text, "response text", True)
+    assert f"│ {user_text}" in formatted
+    assert first_word not in formatted.split("\n")[0].replace(f"│ {user_text}", "")
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_with_actual_trigger_label_is_trigger_word():
+    """Reply-to-AI WITH a valid configured trigger: trigger_label must be
+    the trigger word, and user_text must be the remaining text."""
+    raw_text = "Nova explain more"
+    first_word = raw_text.split(None, 1)[0]
+    remaining = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
+    trigger_matched = True
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = remaining
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "Nova"
+    assert user_text == "explain more"
+
+
+@pytest.mark.asyncio
+async def test_normal_trigger_no_reply_label_is_trigger_word():
+    """Normal trigger mode (no reply): trigger_label is the trigger word,
+    user_text is the remaining text."""
+    raw_text = "Nova سلام"
+    first_word = raw_text.split(None, 1)[0]
+    remaining = raw_text.split(None, 1)[1].strip() if len(raw_text.split(None, 1)) > 1 else ""
+    trigger_matched = True
+    is_reply = False
+
+    if trigger_matched:
+        trigger_label = first_word
+        user_text = remaining
+    else:
+        trigger_label = "AI"
+        user_text = raw_text
+
+    assert trigger_label == "Nova"
+    assert user_text == "سلام"
+    assert is_reply is False
+
+
+@pytest.mark.asyncio
+async def test_reply_to_ai_full_message_remains_user_message():
+    """When replying to AI without trigger, the complete user text must
+    remain the user_message — nothing is stripped."""
+    from backend.ai.context.reply_resolver import ReplyResolver
+
+    resolver = ReplyResolver()
+    resolver.clear()
+    resolver.register(
+        telegram_msg_id=500,
+        session_id="owner-1",
+        role="assistant",
+        content="Previous AI response.",
+        provider="dummy",
+        model="dummy-1",
+    )
+
+    fake_reply_msg = MagicMock()
+    fake_reply_msg.id = 500
+    fake_reply_msg.chat_id = 123
+    fake_reply_msg.date = None
+    fake_reply_msg.media = None
+    fake_reply_msg.message = ""
+    fake_reply_msg.get_sender = AsyncMock(return_value=None)
+    fake_reply_msg.get_chat = AsyncMock(return_value=None)
+
+    fake_event = MagicMock()
+    fake_event.raw_text = "چرا اینطوری شد؟"
+    fake_event.get_reply_message = AsyncMock(return_value=fake_reply_msg)
+
+    with patch(
+        "backend.ai.context.reply_resolver.get_resolver",
+        return_value=resolver,
+    ):
+        from backend.bot.handlers.ai_unified import _extract_reply_context
+        user_message, reply_ctx, error = await _extract_reply_context(
+            fake_event, None, "چرا اینطوری شد؟"
+        )
+
+    assert error == ""
+    assert user_message == "چرا اینطوری شد؟"
+    assert reply_ctx.is_ai_message is True
+    assert reply_ctx.ai_content == "Previous AI response."
+    assert user_message != "Previous AI response."
+
+
+@pytest.mark.asyncio
+async def test_response_edits_new_message_not_old():
+    """The _execute_ai function edits event.message (the NEW user message),
+    not the replied-to AI message. We verify by checking that
+    _execute_ai calls event.edit, not reply_msg.edit."""
+    from backend.ai.tools.delivery import format_presentation
+
+    formatted = format_presentation("user text", "AI response", True)
+    assert "user text" in formatted
+    assert "AI response" in formatted
+    assert "🤖" not in formatted

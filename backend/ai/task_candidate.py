@@ -1,0 +1,446 @@
+"""Untrusted structured task candidates; no persistence or execution authority."""
+from __future__ import annotations
+
+import math
+import re
+from dataclasses import dataclass
+from typing import Any
+
+from backend.ai.database.task_repository import MAX_ACTIONS, MAX_PAYLOAD_BYTES
+from backend.ai.scheduling import ScheduleError, parse_schedule
+from backend.ai.task_contract import (
+    BRANCH_KEY,
+    BRANCH_VALUES,
+    CONDITION_KEY,
+    QUESTION_TOOL,
+    WAIT_KEY,
+    TaskContractError,
+    validate_ai_instruction,
+    validate_condition,
+    validate_question_text,
+)
+
+MAX_LABEL_CHARS = 256
+MAX_TIMEZONE_CHARS = 128
+
+# Unit-keyed interval aliases -> seconds. `parse_schedule` requires the
+# canonical {"seconds": N} form; models emit human-natural unit forms (e.g.
+# {"minutes": 3}, {"interval": 3, "unit": "minutes"}). Every accepted shape
+# below is a single unambiguous, bounded, deterministic representation of
+# "every N <unit>"; anything ambiguous or unknown falls through to
+# parse_schedule, which rejects it with the schedule structure attached.
+_INTERVAL_UNIT_SECONDS = {
+    "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+    "hour": 3600, "hours": 3600, "hr": 3600, "hrs": 3600,
+    "day": 86400, "days": 86400,
+    "week": 604800, "weeks": 604800,
+    # Persian unit words, incl. flat shapes a Persian-request model may emit.
+    "ثانیه": 1, "دقیقه": 60, "ساعت": 3600, "روز": 86400, "هفته": 604800,
+}
+# Unit STRING values accepted in (value, unit) pair shapes, incl. the Persian
+# unit words a Persian-request model may echo back.
+_UNIT_WORD_SECONDS = {
+    **_INTERVAL_UNIT_SECONDS,
+    "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+}
+# Upper bound for a canonicalized interval (10 years). Calendar month/year
+# units are deliberately NOT in any vocabulary above — converting them to
+# fixed seconds would fabricate calendar semantics the scheduler cannot
+# represent; such shapes fall through to honest rejection.
+_MAX_INTERVAL_SECONDS = 366 * 24 * 3600 * 10
+# Value STRING forms that embed their own unit ("5 minutes", "5 دقیقه") —
+# split on whitespace into number + unit word; anything else stays rejected.
+_EMBEDDED_UNIT_MAX_WORDS = 2
+_VALUE_KEYS = frozenset({"interval", "value", "every", "amount", "count", "number", "n", "repeat"})
+_UNIT_VALUE_KEYS = frozenset({"unit", "units", "time_unit", "unit_name", "granularity"})
+_COMPOUND_KEY_RE = re.compile(
+    r"^(?:interval|every|each|repeat)_(minutes?|mins?|hours?|hrs?|days?|weeks?|seconds?|secs?)$"
+)
+# Persian/Arabic-Indic digits a model may emit inside numeric strings.
+_DIGIT_TRANSLATION = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _as_number(value: Any) -> float | None:
+    """Finite float from int/float or a plain numeric string (Persian digits
+    included); None for bools, non-numeric strings, and everything else."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip().translate(_DIGIT_TRANSLATION))
+        except ValueError:
+            return None
+    return None
+
+
+def _schedule_structure(schedule: Any) -> str:
+    """Bounded, safe structural fingerprint for rejection diagnostics.
+
+    Keys (sorted, truncated), value types, and at most one numeric preview —
+    never message content, destinations, or the raw provider response.
+    """
+    if not isinstance(schedule, dict):
+        return f"type={type(schedule).__name__}"
+    keys = sorted(str(k)[:24] for k in schedule)[:6]
+    types = ",".join(type(schedule[k]).__name__ for k in sorted(schedule, key=str)[:6])
+    seconds = schedule.get("seconds")
+    seconds_desc = type(seconds).__name__
+    number = _as_number(seconds)
+    if number is not None and math.isfinite(number):
+        seconds_desc += f"={number:g}"
+    return (
+        f"keys={','.join(keys) or '-'}|types={types or '-'}"
+        f"|has_seconds={str('seconds' in schedule).lower()}|seconds={seconds_desc}"
+        f"|unit_key={str(any(k in _INTERVAL_UNIT_SECONDS for k in schedule)).lower()}"
+        f"|nested={str(any(isinstance(v, dict) for v in schedule.values())).lower()}"
+    )
+
+
+def _convert_value_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """{"interval": 3, "unit": "minutes"} -> {"seconds": 180}.
+
+    Accepts exactly one numeric value key and at most one string unit key
+    from the bounded vocabularies. The unit may also be EMBEDDED in the
+    value string ({"interval": "5 minutes"}, {"every": "5 دقیقه"}) — split
+    on whitespace into number + unit word; a numeric value together with a
+    unit key takes precedence. A stray timezone key is dropped (interval
+    schedules carry no timezone). Any other extra key, unknown unit word, or
+    invalid number leaves the shape unmatched (the schedule is then rejected
+    downstream with its structure attached).
+    """
+    value_keys = [k for k in schedule if k in _VALUE_KEYS]
+    unit_keys = [k for k in schedule if k in _UNIT_VALUE_KEYS and isinstance(schedule[k], str)]
+    if len(value_keys) != 1 or len(unit_keys) > 1:
+        return None
+    raw = schedule[value_keys[0]]
+    number = _as_number(raw)
+    unit = schedule[unit_keys[0]].strip().lower() if unit_keys else None
+    if number is None:
+        # Only a STRING value may carry an embedded unit ("5 minutes");
+        # bools/lists/dicts never do — leave the shape unmatched so the
+        # schedule is rejected downstream instead of crashing.
+        if not isinstance(raw, str):
+            return None
+        parts = raw.strip().split()
+        if len(parts) != _EMBEDDED_UNIT_MAX_WORDS or len(parts[1]) > 24:
+            return None
+        number = _as_number(parts[0])
+        if unit is None:
+            unit = parts[1].strip().lower()
+        if number is None:
+            return None
+    if unit is None or unit not in _UNIT_WORD_SECONDS:
+        return None
+    extras = set(schedule) - {value_keys[0]} - set(unit_keys)
+    if extras - {"timezone"}:
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    seconds = number * _UNIT_WORD_SECONDS[unit]
+    if seconds > _MAX_INTERVAL_SECONDS:
+        return None
+    return {"seconds": seconds}
+
+
+def _convert_compound_key_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """{"interval_minutes": 3} -> {"seconds": 180}."""
+    for key in schedule:
+        match = _COMPOUND_KEY_RE.match(str(key).strip().lower())
+        if not match:
+            continue
+        if set(schedule) - {key} - {"timezone"}:
+            return None
+        number = _as_number(schedule[key])
+        if number is None or not math.isfinite(number) or number <= 0:
+            return None
+        unit = match.group(1)
+        seconds = number * _INTERVAL_UNIT_SECONDS[unit]
+        if seconds > _MAX_INTERVAL_SECONDS:
+            return None
+        return {"seconds": seconds}
+    return None
+
+
+def _convert_flat_unit_schedule(schedule: dict[str, Any]) -> dict[str, Any] | None:
+    """{"minutes": 3} -> {"seconds": 180}; one or more unit keys allowed.
+
+    Multiple unit keys are a COMPOUND duration ("1 hour and 30 minutes" →
+    {"hours": 1, "minutes": 30} → 5400). Every key must be a known duration
+    unit with a bounded positive value; the sum is bounded. Calendar
+    month/year keys are not in the vocabulary and fall through to honest
+    rejection — never fabricated seconds.
+    """
+    units = [key for key in schedule if key in _INTERVAL_UNIT_SECONDS]
+    if not units:
+        return None
+    extras = set(schedule) - set(units)
+    if extras - {"timezone"}:
+        return None
+    total = 0.0
+    for key in units:
+        number = _as_number(schedule[key])
+        if number is None or not math.isfinite(number) or number <= 0:
+            return None
+        total += number * _INTERVAL_UNIT_SECONDS[key]
+    if total <= 0 or total > _MAX_INTERVAL_SECONDS:
+        return None
+    return {"seconds": total}
+
+
+def _canonicalize_interval_schedule(schedule: Any) -> Any:
+    """Return the canonical {"seconds": N>0} form for a recognized shape;
+    otherwise return the schedule unchanged so parse_schedule rejects it and
+    the rejection carries the schedule structure."""
+    if not isinstance(schedule, dict):
+        return schedule
+    if "seconds" in schedule:
+        number = _as_number(schedule["seconds"])
+        if number is not None and math.isfinite(number) and 0 < number <= _MAX_INTERVAL_SECONDS:
+            return {"seconds": number}
+        return schedule
+    for converter in (
+        _convert_value_unit_schedule,
+        _convert_compound_key_schedule,
+        _convert_flat_unit_schedule,
+    ):
+        converted = converter(schedule)
+        if converted is not None:
+            return converted
+    return schedule
+
+# ── Canonical task-execution actions ──
+#
+# A candidate's actions are executed later by the registered ToolExecutor, so
+# every persisted action name must resolve to a registered tool. Message
+# writing is the canonical scheduled action: the model may emit any alias
+# below, but each is normalized to the single registered ``send_message``
+# tool carrying ONLY a bounded ``text`` argument. Destination/owner identity
+# are never accepted from the model — the execution tool resolves the
+# owner's own chat from trusted runtime context. Anything else (unknown
+# action names, destination fields) remains the existing execution-time
+# registry check's responsibility and fails safely there.
+MAX_SEND_TEXT_CHARS = 4096
+_SEND_ACTION_ALIASES = frozenset({"send", "send_message", "write_message", "send_text"})
+_SEND_TEXT_ALIASES = frozenset({"text", "content", "message", "body"})
+
+
+def _reserved_contract_fields(action: dict[str, Any]) -> dict[str, Any]:
+    """The bounded reserved fields an action may carry besides its tool call.
+
+    Two, and only two: the optional wait boundary of that action and the
+    optional branch label that ties it to the chain's ONE condition. Only their
+    SHAPES are checked here — the creation boundary resolves and bounds the
+    instant against the task's timezone and proves the branch structure over the
+    whole action list. Dropping either silently would turn a requested wait into
+    an immediate execution, or a branch action into an unconditional one, so
+    both are preserved verbatim.
+    """
+    reserved: dict[str, Any] = {}
+    if WAIT_KEY in action:
+        boundary = action[WAIT_KEY]
+        if not isinstance(boundary, str) or not boundary.strip():
+            raise TaskCandidateError("an action wait boundary must be a nonblank timestamp string")
+        reserved[WAIT_KEY] = boundary
+    if BRANCH_KEY in action:
+        branch = action[BRANCH_KEY]
+        if not isinstance(branch, str) or branch.strip() not in BRANCH_VALUES:
+            raise TaskCandidateError("an action branch must be 'true' or 'false'")
+        reserved[BRANCH_KEY] = branch.strip()
+    return reserved
+
+
+def _canonicalize_condition(action: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one untrusted CONDITION action to the bounded contract.
+
+    A condition is the ONE action that declares no tool call, so it carries the
+    reserved condition key and nothing else: it has no arguments a model could
+    prepare and no wait of its own, and its value is a bounded literal — never
+    code, an expression, or a nested object.
+    """
+    if set(action) != {CONDITION_KEY}:
+        raise TaskCandidateError(
+            f"a condition action must contain only '{CONDITION_KEY}'"
+        )
+    try:
+        return {CONDITION_KEY: validate_condition(action[CONDITION_KEY])}
+    except TaskContractError as exc:
+        raise TaskCandidateError(f"invalid condition: {exc}") from exc
+
+
+def _canonicalize_action(action: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one untrusted action to the registered execution contract."""
+    name = action["name"].strip()
+    args = dict(action.get("arguments") or {})
+    reserved = _reserved_contract_fields(action)
+    if name == QUESTION_TOOL:
+        # A question is displayable content, never an instruction carrier:
+        # exactly one bounded plain-text argument survives (no destination,
+        # no ids, no parse mode), so the owner is asked exactly what was
+        # persisted — and the model can never smuggle a Telegram operation
+        # into the ask.
+        if set(args) != {"question"}:
+            raise TaskCandidateError(
+                f"the '{QUESTION_TOOL}' action takes exactly one 'question' argument"
+            )
+        try:
+            question = validate_question_text(args["question"])
+        except TaskContractError as exc:
+            raise TaskCandidateError(f"invalid question: {exc}") from exc
+        return {"name": QUESTION_TOOL, "arguments": {"question": question}, **reserved}
+    if name not in _SEND_ACTION_ALIASES:
+        return {"name": name, "arguments": args, **reserved}
+    text = next((args[k] for k in _SEND_TEXT_ALIASES if k in args), "")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_SEND_TEXT_CHARS:
+        raise TaskCandidateError("message action requires bounded nonblank text content")
+    # Only the bounded text (plus an optional allow-listed display font) travels
+    # forward — a model can never smuggle a destination, recipient, chat id, or
+    # raw Telegram method into the action. The font key names an entry of the
+    # existing canonical display-font registry; the transform itself is applied
+    # at execution time by that same registry, never re-implemented here.
+    arguments: dict[str, Any] = {"text": text.strip()}
+    font = args.get("font")
+    if font is not None:
+        from backend.helper.font_style import is_valid_font, normalize_font_key
+
+        if not is_valid_font(font):
+            raise TaskCandidateError("message action font is not an allowed style")
+        arguments["font"] = normalize_font_key(font)
+    return {"name": "send_message", "arguments": arguments, **reserved}
+
+
+class TaskCandidateError(ValueError):
+    """Candidate is malformed, incomplete, ambiguous, or unsafe."""
+
+
+@dataclass(frozen=True)
+class TaskCandidate:
+    label: str
+    schedule_type: str
+    schedule: dict[str, Any]
+    timezone: str
+    actions: list[dict[str, Any]]
+    notification_destination: dict[str, Any]
+    ai_instruction: str | None = None
+
+    @classmethod
+    def from_untrusted(cls, value: Any) -> "TaskCandidate":
+        if not isinstance(value, dict):
+            raise TaskCandidateError("candidate must be an object")
+        # Tolerated provider shape: a singular `action` alias for `actions`.
+        # It is normalized BEFORE the exact field-set check so downstream
+        # validation is unchanged; every other deviation stays rejected.
+        if "actions" not in value and "action" in value:
+            value = dict(value)
+            value["actions"] = value.pop("action")
+        required = {"label", "schedule_type", "schedule", "timezone", "actions", "notification_destination"}
+        allowed = required | {"ai_instruction"}
+        if set(value) - allowed or required - set(value):
+            raise TaskCandidateError("candidate fields are incomplete or unsupported")
+        label = value["label"]
+        timezone = value["timezone"]
+        schedule = value["schedule"]
+        actions = value["actions"]
+        destination = value["notification_destination"]
+        ai_instruction = value.get("ai_instruction")
+        if ai_instruction is not None:
+            try:
+                ai_instruction = validate_ai_instruction(ai_instruction)
+            except ValueError as exc:
+                raise TaskCandidateError(str(exc)) from exc
+        if not isinstance(label, str) or not label.strip() or len(label) > MAX_LABEL_CHARS:
+            raise TaskCandidateError("label is invalid")
+        if not isinstance(timezone, str) or not timezone.strip() or len(timezone) > MAX_TIMEZONE_CHARS:
+            raise TaskCandidateError("timezone is invalid")
+        if not isinstance(schedule, dict) or not isinstance(destination, dict):
+            raise TaskCandidateError("schedule and notification destination must be objects")
+        if not isinstance(actions, list) or not 1 <= len(actions) <= MAX_ACTIONS:
+            raise TaskCandidateError("actions must contain 1 through 5 items")
+        canonical: list[dict[str, Any]] = []
+        for action in actions:
+            if isinstance(action, dict) and CONDITION_KEY in action:
+                # The ONE action shape that is not a tool call: a bounded
+                # condition over an earlier action's declared output field.
+                # Never alias-normalized — a stray `name`/`arguments` beside it
+                # means the provider answered a different contract, so it fails
+                # closed instead of being interpreted.
+                canonical.append(_canonicalize_condition(action))
+                continue
+            # Tolerate the field-name aliases a model may emit (`tool` for
+            # `name`, `parameters`/`args` for `arguments` — the same aliases
+            # the execution layer already accepts) by normalizing the shape
+            # first; genuinely malformed actions still fail below unchanged.
+            if isinstance(action, dict) and "name" not in action and isinstance(action.get("tool"), str):
+                action = {**action, "name": action["tool"]}
+            if isinstance(action, dict) and "arguments" not in action:
+                for arg_alias in ("parameters", "args"):
+                    if isinstance(action.get(arg_alias), dict):
+                        action = {**action, "arguments": action[arg_alias]}
+                        break
+            if not isinstance(action, dict) or not isinstance(action.get("name"), str) or not action["name"].strip():
+                raise TaskCandidateError("each action requires a tool name")
+            args = action.get("arguments", {})
+            if not isinstance(args, dict):
+                raise TaskCandidateError("action arguments must be objects")
+            canonical.append(_canonicalize_action(action))
+        if len(str(value).encode()) > MAX_PAYLOAD_BYTES:
+            raise TaskCandidateError("candidate exceeds bounded payload size")
+        if value["schedule_type"] == "interval":
+            schedule = _canonicalize_interval_schedule(schedule)
+        if value["schedule_type"] == "event":
+            # Event triggers have no wall-clock time: the schedule must be a
+            # bounded, model-facing trigger spec (names only — ids are
+            # resolved later from trusted runtime context).
+            from backend.ai.task_trigger import TaskTriggerError, validate_trigger_spec
+            trigger = schedule.get("trigger")
+            try:
+                schedule = {"trigger": validate_trigger_spec(trigger)}
+            except TaskTriggerError as exc:
+                raise TaskCandidateError(f"invalid event trigger: {exc}") from exc
+        try:
+            parsed = parse_schedule(value["schedule_type"], schedule)
+        except (ScheduleError, TypeError, ValueError) as exc:
+            # The schedule structure rides on the rejection so one production
+            # occurrence identifies the exact provider shape (keys/types
+            # only — never message content or the raw response).
+            raise TaskCandidateError(
+                f"{exc} [{_schedule_structure(schedule)}]"
+            ) from exc
+        if (
+            value["schedule_type"] not in ("interval", "event")
+            and schedule.get("timezone") != timezone
+        ):
+            raise TaskCandidateError("schedule timezone must match task timezone")
+        # Validate optional chat_name in notification_destination.
+        if "chat_name" in destination:
+            cn = destination["chat_name"]
+            if not isinstance(cn, str) or not cn.strip() or len(cn) > 256:
+                raise TaskCandidateError("chat_name must be a nonblank bounded string")
+        # Delivery/notification flags are explicit task-definition opt-ins;
+        # they must be booleans so the scheduler can never misread them.
+        for flag_key in ("deliver_result", "notify_on_outcome"):
+            if flag_key in destination and not isinstance(destination[flag_key], bool):
+                raise TaskCandidateError(f"{flag_key} must be a boolean")
+        return cls(
+            label.strip(), value["schedule_type"], dict(schedule), timezone.strip(),
+            canonical, dict(destination), ai_instruction,
+        )
+
+    def as_creation_candidate(self) -> dict[str, Any]:
+        candidate = {
+            "label": self.label,
+            "schedule_type": self.schedule_type,
+            "schedule": dict(self.schedule),
+            "timezone": self.timezone,
+            "actions": [dict(action) for action in self.actions],
+            "notification_destination": dict(self.notification_destination),
+        }
+        if self.ai_instruction is not None:
+            candidate["ai_instruction"] = self.ai_instruction
+        return candidate
+
+
+def parse_candidate_output(value: Any) -> TaskCandidate:
+    """Parse only structured data; prose or ambiguous output is rejected."""
+    return TaskCandidate.from_untrusted(value)

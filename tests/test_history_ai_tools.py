@@ -1,0 +1,1301 @@
+"""
+History AI tools — translation and summarization of Telegram history.
+
+Contract this file pins:
+
+  1. Telegram history comes only from ``backend/services/history_service.py``;
+     the new tools and the history AI service contain no Telethon access, no
+     paging and no provenance filtering of their own.
+  2. Translation preserves message identity (``[id]``) and chronological order,
+     sends every requested text message to the LLM, never loses or merges
+     messages, and never truncates text.
+  3. Summarization is genuine LLM work through the existing ProviderManager,
+     hierarchical for long histories (map per chunk -> reduce), with a single
+     chunk short-circuiting the reduce step.
+  4. Chunking is bounded by the project's own token estimator and the provider's
+     configured output budget; a single oversized message is never split.
+  5. Failures (retrieval, provider, budget, too-large) are honest and
+     distinguishable from an empty-but-successful result.
+
+No network and no live Telegram: a scripted provider is registered in the REAL
+``ProviderRegistry``/``ProviderManager``, and the Telegram client is a fake
+shaped like the Telethon surface the facade consumes.
+"""
+from __future__ import annotations
+
+import asyncio
+import inspect
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+import pytest
+
+from backend.ai.context.provenance import AI_PROVENANCE_MARKER
+from backend.ai.conversation.telegram_context import MAX_CONTEXT_MESSAGES
+from backend.ai.engine.dispatcher import _VERBATIM_READ_TOOLS, Dispatcher
+from backend.ai.prompt.budget import DEFAULT_MAX_CONTEXT_TOKENS, estimate_tokens
+from backend.ai.providers.base.capabilities import ProviderCapabilities
+from backend.ai.providers.base.config import ProviderConfig
+from backend.ai.providers.base.contract import BaseProvider, ProviderResponse
+from backend.ai.providers.manager.manager import ProviderManager
+from backend.ai.providers.registry.registry import ProviderRegistry
+from backend.ai.tools.base import PermissionLevel, requires_owner_confirmation
+from backend.ai.tools.context import ToolContext
+from backend.ai.tools.executor import ToolExecutor
+from backend.ai.tools.history_ai import SummarizeHistoryTool, TranslateHistoryTool
+from backend.ai.tools.registry import create_default_registry
+from backend.services import history_ai_service, history_service
+from backend.telegram_api.api import TelegramAPI
+
+CHAT = -100555000
+OWNER = 7770001
+NOW = datetime(2026, 9, 14, 14, 2, tzinfo=timezone.utc)
+
+#: The real pacing function, for the tests that prove pacing itself.
+_REAL_CALL_SPACING = history_ai_service.call_spacing
+
+
+@pytest.fixture(autouse=True)
+def _fast_pacing(monkeypatch):
+    """Keep the suite fast: call spacing has its own dedicated tests below."""
+    monkeypatch.setattr(history_ai_service, "call_spacing", lambda calls, budget: 0.0)
+
+
+# ── Fake Telegram surface ──
+
+
+class _FakeMessage:
+    def __init__(self, mid: int, text: str = "", *, media: bool = False, out: bool = True) -> None:
+        self.id = mid
+        self.chat_id = CHAT
+        self.sender_id = OWNER if out else 4242
+        self.text = text
+        self.date = NOW
+        self.media = object() if media else None
+        self.reply_to = None
+        self.out = out
+
+
+class _FakeClient:
+    def __init__(self, messages: list[_FakeMessage]) -> None:
+        self._messages = list(messages)
+        self.calls: list[dict[str, Any]] = []
+
+    def iter_messages(self, chat_id: Any, **kwargs: Any):
+        self.calls.append({"chat_id": chat_id, **kwargs})
+        limit = kwargs.get("limit")
+        min_id = kwargs.get("min_id")
+        max_id = kwargs.get("max_id")
+        selected = [
+            m for m in self._messages
+            if (max_id is None or m.id < max_id) and (min_id is None or m.id > min_id)
+        ]
+        selected.sort(key=lambda m: m.id, reverse=True)
+        if limit is not None:
+            selected = selected[:limit]
+
+        async def _aiter():
+            for item in selected:
+                yield item
+
+        return _aiter()
+
+
+class _FailingClient:
+    def iter_messages(self, chat_id: Any, **kwargs: Any):
+        async def _boom():
+            raise ConnectionError("mtproto down")
+            yield  # pragma: no cover
+
+        return _boom()
+
+
+# ── Scripted provider (registered in the REAL manager) ──
+
+
+def _translating_provider(messages: list[dict[str, Any]], payload: str) -> str:
+    """Echo every ``[id] text`` line back as ``[id] TR:text``."""
+    out = []
+    for line in payload.splitlines():
+        match = re.match(r"^\s*\[(\d+)\]\s*(.*)$", line)
+        if match:
+            out.append(f"[{match.group(1)}] TR:{match.group(2)}")
+    return "\n".join(out)
+
+
+def _summarizing_provider(messages: list[dict[str, Any]], payload: str) -> str:
+    if "merge partial summaries" in messages[0]["content"]:
+        return "FINAL"
+    return f"SUMMARY({len(payload.splitlines())})"
+
+
+class _ScriptedProvider(BaseProvider):
+    def __init__(
+        self,
+        responder: Any = None,
+        *,
+        fail_on_calls: set[int] | None = None,
+        delay: float = 0.0,
+    ) -> None:
+        super().__init__(
+            ProviderConfig(provider_name="scripted", enabled=True, default_model="m1")
+        )
+        self.calls = 0
+        self.prompts: list[list[dict[str, Any]]] = []
+        self._responder = responder
+        self._fail_on = set(fail_on_calls or ())
+        self._delay = delay
+
+    @property
+    def name(self) -> str:
+        return "scripted"
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        return ProviderCapabilities(supports_tools=True)
+
+    async def chat(self, messages, **kwargs) -> ProviderResponse:
+        self.prompts.append([dict(m) for m in messages])
+        self.calls += 1
+        if self._delay:
+            await asyncio.sleep(self._delay)
+        if self.calls in self._fail_on:
+            return ProviderResponse(
+                text="", provider_name="scripted", success=False,
+                metadata={"failure_type": "rate_limit"},
+            )
+        payload = messages[-1]["content"] if messages else ""
+        text = self._responder(messages, payload) if self._responder else "ok"
+        return ProviderResponse(text=text, provider_name="scripted", success=True)
+
+    def initialize(self) -> None:
+        return None
+
+    def shutdown(self) -> None:
+        return None
+
+    def count_tokens(self, text: str) -> int:
+        return max(1, len(text) // 4)
+
+    def health(self) -> dict[str, Any]:
+        return {"healthy": True, "ready": True}
+
+
+def _manager(provider: _ScriptedProvider) -> ProviderManager:
+    registry = ProviderRegistry()
+    registry.register(provider)
+    return ProviderManager(registry)
+
+
+def _context(manager: ProviderManager, client: Any, *, use_facade: bool = True) -> ToolContext:
+    return ToolContext(
+        telegram=TelegramAPI(client) if use_facade else None,
+        owner_id=OWNER,
+        tz_str="UTC",
+        client=client,
+        extra={"chat_id": CHAT, "provider_manager": manager},
+    )
+
+
+async def _run_translate(manager: ProviderManager, client: Any, arguments: dict[str, Any]):
+    """Execute the translate tool the way ToolExecutor does (same context)."""
+    context = _context(manager, client)
+    return await TranslateHistoryTool(context).execute(context, arguments)
+
+
+async def _run_summarize(manager: ProviderManager, client: Any, arguments: dict[str, Any]):
+    context = _context(manager, client)
+    return await SummarizeHistoryTool(context).execute(context, arguments)
+
+
+def _conversation(count: int, *, text: str = "message") -> list[_FakeMessage]:
+    return [_FakeMessage(mid, f"{text} {mid}") for mid in range(1, count + 1)]
+
+
+def _payloads(provider: _ScriptedProvider) -> list[str]:
+    return [p[-1]["content"] for p in provider.prompts]
+
+
+def _user_payload_ids(payload: str) -> list[int]:
+    return [int(m.group(1)) for m in re.finditer(r"\[(\d+)\]", payload)]
+
+
+def _sent_ids(provider: _ScriptedProvider) -> list[int]:
+    """Ids the provider saw in map calls only (merge prompts carry summaries)."""
+    return [
+        mid
+        for prompt in provider.prompts
+        if "merge partial summaries" not in prompt[0]["content"]
+        for mid in _user_payload_ids(prompt[-1]["content"])
+    ]
+
+
+# ── 1. Translation ──
+
+
+@pytest.mark.asyncio
+async def test_translate_returns_one_line_per_message_in_order():
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(5)), {"count": 5})
+
+    assert result.success is True
+    assert result.message.splitlines() == [
+        f"[{mid}] TR:message {mid}" for mid in range(1, 6)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_translate_message_identity_and_order_are_preserved():
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(40)), {"count": 40})
+
+    ids = [int(re.match(r"^\[(\d+)\]", line).group(1)) for line in result.message.splitlines()]
+    assert ids == list(range(1, 41))
+    assert len(ids) == len(set(ids))
+
+
+@pytest.mark.asyncio
+async def test_translate_requests_exactly_the_requested_count_oldest_to_newest():
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(50)), {"count": 10})
+
+    assert _user_payload_ids(_payloads(provider)[0]) == list(range(41, 51))
+    assert len(result.message.splitlines()) == 10
+
+
+@pytest.mark.asyncio
+async def test_translate_pages_through_multiple_pages_of_history():
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient(_conversation(250))
+    result = await _run_translate(_manager(provider), client, {"count": 250})
+
+    assert len(client.calls) == 3  # history_service paged backwards
+    assert [call.get("max_id") for call in client.calls] == [None, 151, 51]
+    assert sorted(set(_sent_ids(provider))) == list(range(1, 251))
+    assert len(result.message.splitlines()) == 250
+
+
+@pytest.mark.asyncio
+async def test_translate_empty_history_succeeds_without_calling_the_provider():
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FakeClient([]), {"count": 10})
+
+    assert result.success is True
+    assert provider.calls == 0
+    assert "no messages" in result.message.lower()
+    assert result.data["processed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_translate_media_only_and_empty_messages_keep_their_place():
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient([
+        _FakeMessage(1, "hello"),
+        _FakeMessage(2, "", media=True),
+        _FakeMessage(3, "   "),
+        _FakeMessage(4, "bye"),
+    ])
+    result = await _run_translate(_manager(provider), client, {"count": 4})
+
+    assert result.message.splitlines() == [
+        "[1] TR:hello", "[2] [media]", "[3] (empty message)", "[4] TR:bye",
+    ]
+    assert _user_payload_ids(_payloads(provider)[0]) == [1, 4]
+    assert result.data["text_messages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_translate_never_truncates_message_text():
+    long_text = "x" * 3000
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient([_FakeMessage(1, long_text)])
+    await _run_translate(_manager(provider), client, {"count": 1})
+
+    assert long_text in _payloads(provider)[0]
+    assert "…" not in _payloads(provider)[0]
+
+
+@pytest.mark.asyncio
+async def test_translate_history_failure_is_reported_not_treated_as_empty():
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FailingClient(), {"count": 10})
+
+    assert result.success is False
+    assert result.message.startswith("❌")
+    assert result.data["error"] == history_ai_service.ERROR_HISTORY
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_translate_reports_truncated_history_honestly():
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(5)), {"count": 50})
+
+    assert result.success is True
+    assert "Only 5 of the requested 50" in result.message
+    assert result.data["processed"] == 5
+
+
+@pytest.mark.asyncio
+async def test_translate_count_beyond_the_bound_is_capped_and_stated(monkeypatch):
+    requested: list[int] = []
+    real = history_service.fetch_recent_history
+
+    async def _record(source, chat_id, **kwargs):
+        requested.append(kwargs["count"])
+        return await real(source, chat_id, **kwargs)
+
+    monkeypatch.setattr(history_service, "fetch_recent_history", _record)
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(
+        _manager(provider), _FakeClient(_conversation(5)), {"count": 50_000},
+    )
+
+    assert requested == [history_service.MAX_HISTORY_MESSAGES]
+    assert result.data["capped"] is True
+    assert str(history_service.MAX_HISTORY_MESSAGES) in result.message
+
+
+@pytest.mark.asyncio
+async def test_translate_provider_failure_is_honest():
+    provider = _ScriptedProvider(_translating_provider, fail_on_calls={1})
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert result.success is False
+    assert result.message.startswith("❌")
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+    assert "TR:" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_translate_incomplete_model_output_fails_instead_of_dropping_messages():
+    def _partial(messages, payload):  # omits every message after the first
+        first = re.match(r"^\s*\[(\d+)\]\s*(.*)$", payload.splitlines()[0])
+        return f"[{first.group(1)}] TR:{first.group(2)}"
+
+    provider = _ScriptedProvider(_partial)
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert result.success is False
+    assert "no translation" in result.message
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+
+
+@pytest.mark.asyncio
+async def test_translate_excludes_ai_provenance_messages_centrally():
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient([
+        _FakeMessage(1, "human one"),
+        _FakeMessage(2, f"an AI answer{AI_PROVENANCE_MARKER}"),
+        _FakeMessage(3, "human two"),
+    ])
+    result = await _run_translate(_manager(provider), client, {"count": 3})
+
+    assert _sent_ids(provider) == [1, 3]
+    assert "[2]" not in result.message
+    assert AI_PROVENANCE_MARKER not in result.message
+    assert AI_PROVENANCE_MARKER not in "".join(_payloads(provider))
+
+
+@pytest.mark.asyncio
+async def test_translate_chunks_large_histories_without_losing_messages(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "TRANSLATE_CHUNK_TOKEN_BUDGET", 6)
+    provider = _ScriptedProvider(_translating_provider)
+    result = await _run_translate(_manager(provider), _FakeClient(_conversation(6)), {"count": 6})
+
+    assert provider.calls == 6
+    assert len(result.message.splitlines()) == 6
+    assert _sent_ids(provider) == list(range(1, 7))
+
+
+@pytest.mark.asyncio
+async def test_translate_works_through_a_raw_client_and_a_facade_identically():
+    via_facade = _ScriptedProvider(_translating_provider)
+    via_client = _ScriptedProvider(_translating_provider)
+    context_facade = _context(_manager(via_facade), _FakeClient(_conversation(4)), use_facade=True)
+    context_raw = _context(_manager(via_client), _FakeClient(_conversation(4)), use_facade=False)
+
+    first = await TranslateHistoryTool(context_facade).execute(context_facade, {"count": 4})
+    second = await TranslateHistoryTool(context_raw).execute(context_raw, {"count": 4})
+
+    assert first.success is True
+    assert first.message == second.message
+
+
+@pytest.mark.asyncio
+async def test_translate_without_chat_context_fails_clearly():
+    context = ToolContext(telegram=None, owner_id=OWNER, tz_str="UTC")
+    result = await TranslateHistoryTool(context).execute(context, {"count": 5})
+    assert result.success is False
+    assert "No chat context" in result.message
+
+
+# ── 2. Summarization ──
+
+
+@pytest.mark.asyncio
+async def test_summarize_small_history_uses_one_llm_call_and_no_reduce():
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(5)), {"count": 5})
+
+    assert result.success is True
+    assert provider.calls == 1
+    assert result.message == "SUMMARY(5)"
+
+
+@pytest.mark.asyncio
+async def test_summarize_multi_chunk_history_aggregates_hierarchically(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 6)
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert provider.calls == 4  # 3 chunk summaries + 1 final merge
+    assert result.message == "FINAL"
+    reduce_prompt = provider.prompts[-1]
+    assert "merge partial summaries" in reduce_prompt[0]["content"]
+    assert reduce_prompt[-1]["content"].count("SUMMARY(1)") == 3
+
+
+@pytest.mark.asyncio
+async def test_summarize_orders_history_before_summarizing():
+    provider = _ScriptedProvider(_summarizing_provider)
+    await _run_summarize(_manager(provider), _FakeClient(_conversation(60)), {"count": 60})
+
+    chunk_ids = [
+        _user_payload_ids(prompt[-1]["content"]) for prompt in provider.prompts
+    ]
+    assert all(ids == sorted(ids) for ids in chunk_ids)
+    assert [mid for ids in chunk_ids for mid in ids] == list(range(1, 61))
+
+
+@pytest.mark.asyncio
+async def test_summarize_500_messages_map_reduces_within_the_budget():
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(500)), {"count": 500})
+
+    assert result.success is True
+    assert result.data["processed"] == 500
+    chunks = provider.calls - 1
+    assert chunks > 1
+    assert result.message == "FINAL"
+    assert sorted(set(_sent_ids(provider))) == list(range(1, 501))
+
+
+@pytest.mark.asyncio
+async def test_summarize_1000_messages_uses_the_service_boundary():
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(
+        _manager(provider), _FakeClient(_conversation(1000)), {"count": 1000},
+    )
+
+    assert result.success is True
+    assert result.data["processed"] == 1000
+    assert result.data["capped"] is False
+    sent = _sent_ids(provider)
+    assert len(sent) == 1000
+    assert sorted(set(sent)) == list(range(1, 1001))
+
+
+@pytest.mark.asyncio
+async def test_no_chunk_exceeds_the_token_budget():
+    provider = _ScriptedProvider(_summarizing_provider)
+    await _run_summarize(_manager(provider), _FakeClient(_conversation(300)), {"count": 300})
+
+    for payload in _payloads(provider):
+        conservative = max(
+            estimate_tokens(payload, "English"), estimate_tokens(payload, "Persian")
+        )
+        assert conservative <= history_ai_service.SUMMARIZE_CHUNK_TOKEN_BUDGET + 40
+
+
+@pytest.mark.asyncio
+async def test_oversized_single_message_is_its_own_chunk_and_never_split(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 4)
+    huge = "y" * 2000
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient([_FakeMessage(1, huge), _FakeMessage(2, "small")])
+    await _run_summarize(_manager(provider), client, {"count": 2})
+
+    payloads = _payloads(provider)
+    assert huge in payloads[0]
+    assert "[1]" in payloads[0]
+    assert "[2]" not in payloads[0]
+
+
+@pytest.mark.asyncio
+async def test_summarize_excludes_ai_provenance_messages():
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient([
+        _FakeMessage(1, "human one"),
+        _FakeMessage(2, f"AI answer{AI_PROVENANCE_MARKER}"),
+    ])
+    result = await _run_summarize(_manager(provider), client, {"count": 2})
+
+    assert result.success is True
+    assert _sent_ids(provider) == [1]
+    assert AI_PROVENANCE_MARKER not in result.message
+
+
+@pytest.mark.asyncio
+async def test_summarize_empty_history_succeeds_without_llm_calls():
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient([]), {"count": 10})
+
+    assert result.success is True
+    assert provider.calls == 0
+    assert "no messages" in result.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_summarize_media_only_history_succeeds_without_llm_calls():
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient([_FakeMessage(1, "", media=True), _FakeMessage(2, "")])
+    result = await _run_summarize(_manager(provider), client, {"count": 2})
+
+    assert result.success is True
+    assert provider.calls == 0
+    assert result.data["text_messages"] == 0
+
+
+@pytest.mark.asyncio
+async def test_summarize_history_failure_is_reported_not_treated_as_empty():
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FailingClient(), {"count": 10})
+
+    assert result.success is False
+    assert result.message.startswith("❌")
+    assert result.data["error"] == history_ai_service.ERROR_HISTORY
+
+
+@pytest.mark.asyncio
+async def test_summarize_reports_truncated_history_honestly():
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(4)), {"count": 400})
+
+    assert result.success is True
+    assert "Only 4 of the requested 400" in result.message
+
+
+@pytest.mark.asyncio
+async def test_summarize_chunk_failure_is_not_presented_as_a_summary(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 6)
+    provider = _ScriptedProvider(_summarizing_provider, fail_on_calls={2})
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert result.success is False
+    assert "SUMMARY" not in result.message
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+
+
+@pytest.mark.asyncio
+async def test_summarize_final_aggregation_failure_is_honest(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 6)
+    provider = _ScriptedProvider(_summarizing_provider, fail_on_calls={4})
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert result.success is False
+    assert "SUMMARY" not in result.message
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+
+
+@pytest.mark.asyncio
+async def test_summarize_budget_timeout_is_an_honest_failure(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "llm_budget", lambda _envelope: 0.01)
+    provider = _ScriptedProvider(_summarizing_provider, delay=0.2)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(5)), {"count": 5})
+
+    assert result.success is False
+    assert "did not finish" in result.message
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+
+
+@pytest.mark.asyncio
+async def test_history_too_large_for_one_request_is_refused_honestly(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 1)
+    monkeypatch.setattr(history_ai_service, "max_map_calls", lambda _budget: 2)
+    provider = _ScriptedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(5)), {"count": 5})
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_TOO_LARGE
+    assert provider.calls == 0
+    assert "fewer messages" in result.message
+
+
+@pytest.mark.asyncio
+async def test_missing_ai_engine_is_reported():
+    ok, text, data = await history_ai_service.summarize_history(
+        _FakeClient(_conversation(2)), CHAT, count=2, provider_manager=None,
+    )
+
+    assert ok is False
+    assert text.startswith("❌")
+    assert data["error"] in {
+        history_ai_service.ERROR_ENGINE, history_ai_service.ERROR_PROVIDER,
+    }
+
+
+# ── 3. Architecture ──
+
+
+def test_chunk_budgets_are_derived_from_existing_architecture():
+    assert history_ai_service.TRANSLATE_CHUNK_TOKEN_BUDGET == min(
+        DEFAULT_MAX_CONTEXT_TOKENS, ProviderConfig().max_tokens // 2
+    )
+    # A chunk summary is far shorter than its input, so summarization may use
+    # the whole context budget — fewer provider calls for the same history.
+    assert history_ai_service.SUMMARIZE_CHUNK_TOKEN_BUDGET == DEFAULT_MAX_CONTEXT_TOKENS
+    assert history_ai_service.MAP_CONCURRENCY == 2
+    assert history_ai_service.MAX_CALL_SPACING_S == 5.0
+    # The pacing assumption mirrors the provider HTTP bound...
+    assert history_ai_service.ASSUMED_CALL_LATENCY_S == ProviderConfig().timeout
+    # ...while the per-call bound is the ceiling and one pacing interval.
+    assert (
+        history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+        == history_ai_service.DEFAULT_ENVELOPE_S / 2
+    )
+    assert history_ai_service.MIN_PROVIDER_CALL_TIMEOUT_S == history_ai_service.MAX_CALL_SPACING_S
+
+
+@pytest.mark.asyncio
+async def test_both_tools_retrieve_history_through_the_history_service(monkeypatch):
+    calls: list[dict[str, Any]] = []
+    real = history_service.fetch_recent_history
+
+    async def _record(source, chat_id, **kwargs):
+        calls.append({"chat_id": chat_id, **kwargs})
+        return await real(source, chat_id, **kwargs)
+
+    monkeypatch.setattr(history_service, "fetch_recent_history", _record)
+    provider = _ScriptedProvider(_translating_provider)
+
+    await _run_translate(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+    await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert [c["count"] for c in calls] == [3, 3]
+    assert all(c["chat_id"] == CHAT for c in calls)
+
+
+def test_new_modules_contain_no_telegram_paging_or_provenance_logic():
+    from backend.ai.tools import history_ai as history_ai_tools
+
+    for module in (history_ai_service, history_ai_tools):
+        source = inspect.getsource(module)
+        assert re.search(r"^\s*(import|from)\s+telethon", source, re.MULTILINE) is None
+        assert ".iter_messages(" not in source
+        assert "has_ai_provenance_marker" not in source
+        assert "AI_PROVENANCE_MARKER" not in source
+        assert "ProviderManager(" not in source
+        assert "get_engine()" in source or module is history_ai_tools
+
+
+def test_tools_are_registered_as_read_only_and_long_running():
+    registry = create_default_registry(
+        ToolContext(telegram=None, owner_id=OWNER, tz_str="UTC")
+    )
+    for name in ("translate_history", "summarize_history"):
+        tool = registry.get(name)
+        assert tool is not None
+        assert tool.permission_level is PermissionLevel.READ_ONLY
+        assert tool.safe is True
+        assert tool.long_running is True
+        assert requires_owner_confirmation(tool) is False
+
+    schema = {s["name"]: s for s in registry.list_schemas()}
+    assert schema["translate_history"]["parameters"]["count"]["maximum"] == 1000
+    assert schema["summarize_history"]["parameters"]["count"]["maximum"] == 1000
+    assert "language" in schema["translate_history"]["parameters"]
+
+
+@pytest.mark.asyncio
+async def test_tool_executor_executes_them_without_confirmation():
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient(_conversation(3))
+    context = _context(_manager(provider), client)
+    executor = ToolExecutor(create_default_registry(context), context)
+
+    results = await executor.execute_calls([
+        {"id": "c1", "name": "translate_history", "arguments": {"count": 3}},
+    ])
+
+    assert len(results) == 1
+    assert results[0].success is True
+    assert results[0].message.splitlines()[0] == "[1] TR:message 1"
+
+
+def test_dispatcher_delivers_both_tools_verbatim():
+    assert {"translate_history", "summarize_history"} <= _VERBATIM_READ_TOOLS
+
+    class _Exec:
+        def __init__(self, name: str, success: bool = True) -> None:
+            self.tool_name = name
+            self.success = success
+
+    calls = [{"name": "translate_history"}]
+    assert Dispatcher._read_results_authoritative(calls, [_Exec("translate_history")]) is True
+    assert Dispatcher._read_results_authoritative(
+        calls, [_Exec("translate_history", success=False)]
+    ) is False
+
+
+def test_bounded_request_scoped_context_is_unchanged():
+    assert MAX_CONTEXT_MESSAGES == 10
+
+
+# ── 4. Request-scoped trigger exclusion (live "خلاصه ۳۰ پیام آخر رو بده") ──
+
+
+def _context_with_request(
+    manager: ProviderManager,
+    client: Any,
+    message_id: int,
+    *,
+    request_id: str = "req-1",
+) -> ToolContext:
+    """The dispatcher's request scope: chat, triggering message id, manager.
+
+    ``request_message_id`` is the key ``Dispatcher._build_tool_context`` sets,
+    so this is the real production context shape.
+    """
+    return ToolContext(
+        telegram=TelegramAPI(client),
+        owner_id=OWNER,
+        tz_str="UTC",
+        client=client,
+        extra={
+            "chat_id": CHAT,
+            "request_message_id": message_id,
+            "request_id": request_id,
+            "provider_manager": manager,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_triggering_message_is_excluded_by_id_from_the_retrieved_history():
+    provider = _ScriptedProvider(_translating_provider)
+    client = _FakeClient(_conversation(30))
+    context = _context_with_request(_manager(provider), client, 30)
+
+    result = await TranslateHistoryTool(context).execute(context, {"count": 30})
+
+    assert result.success is True
+    assert client.calls[0]["max_id"] == 30          # exclusive cursor, not a text filter
+    assert _sent_ids(provider) == list(range(1, 30))
+    assert 30 not in _sent_ids(provider)
+    assert "[30]" not in result.message
+    assert result.data["processed"] == 29
+
+
+@pytest.mark.asyncio
+async def test_trigger_exclusion_is_identity_based_not_text_based():
+    """The same text is kept when it is not the triggering message."""
+    provider = _ScriptedProvider(_translating_provider)
+    command = "خلاصه ۳۰ پیام آخر رو بده"
+    client = _FakeClient([
+        _FakeMessage(1, command),   # older message with identical text
+        _FakeMessage(2, "hello"),
+        _FakeMessage(3, command),   # the triggering command itself
+    ])
+    context = _context_with_request(_manager(provider), client, 3)
+
+    result = await TranslateHistoryTool(context).execute(context, {"count": 3})
+
+    assert result.success is True
+    assert _sent_ids(provider) == [1, 2]
+    assert "[1]" in result.message and "[3]" not in result.message
+
+
+@pytest.mark.asyncio
+async def test_summarize_30_message_request_completes_through_the_tool_path():
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(30))
+    context = _context_with_request(_manager(provider), client, 30)
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 30})
+
+    assert result.success is True
+    assert provider.calls >= 1
+    assert result.message.strip()
+    assert result.data["operation"] == "summarize"
+    assert result.data["processed"] == 29
+    assert 30 not in _sent_ids(provider)
+
+
+@pytest.mark.asyncio
+async def test_request_without_a_scoped_message_id_keeps_the_full_window():
+    """An internal caller with no triggering message is not cursor-bounded."""
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(5))
+
+    result = await _run_summarize(_manager(provider), client, {"count": 5})
+
+    assert result.success is True
+    assert client.calls[0].get("max_id") is None
+    assert result.data["processed"] == 5
+
+
+@pytest.mark.asyncio
+async def test_stage_traces_distinguish_retrieval_provider_and_tool_result(caplog):
+    import logging
+
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(5))
+    context = _context_with_request(_manager(provider), client, 5, request_id="req-trace")
+
+    with caplog.at_level(logging.INFO):
+        result = await SummarizeHistoryTool(context).execute(context, {"count": 5})
+
+    traces = [r.getMessage() for r in caplog.records if "AI_EXEC_TRACE" in r.getMessage()]
+    assert result.success is True
+    assert any("stage=history_retrieval_started" in t and "req-trace" in t for t in traces)
+    assert any("stage=history_retrieval_completed" in t for t in traces)
+    assert any("before_id=5" in t for t in traces)
+    assert any("stage=provider_call_started" in t for t in traces)
+    assert any("stage=provider_call_completed" in t for t in traces)
+    assert any("stage=tool_result" in t and "tool=summarize_history" in t for t in traces)
+    assert any("success=True" in t and "stage=tool_result" in t for t in traces)
+
+
+@pytest.mark.asyncio
+async def test_history_retrieval_failure_is_traced_and_never_a_silent_empty_result(caplog):
+    import logging
+
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_request(
+        _manager(provider), _FailingClient(), 3, request_id="req-fail",
+    )
+
+    with caplog.at_level(logging.INFO):
+        result = await SummarizeHistoryTool(context).execute(context, {"count": 3})
+
+    traces = [r.getMessage() for r in caplog.records if "AI_EXEC_TRACE" in r.getMessage()]
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_HISTORY
+    assert provider.calls == 0
+    assert any("stage=history_retrieval_failed" in t for t in traces)
+    assert any("stage=tool_result" in t and "success=False" in t for t in traces)
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_is_traced_and_surfaced_honestly(caplog):
+    import logging
+
+    provider = _ScriptedProvider(_summarizing_provider, fail_on_calls={1})
+    client = _FakeClient(_conversation(3))
+    context = _context_with_request(_manager(provider), client, 3, request_id="req-pfail")
+
+    with caplog.at_level(logging.INFO):
+        result = await SummarizeHistoryTool(context).execute(context, {"count": 3})
+
+    traces = [r.getMessage() for r in caplog.records if "AI_EXEC_TRACE" in r.getMessage()]
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+    assert any("stage=provider_call_failed" in t for t in traces)
+    assert any("stage=tool_result" in t and "success=False" in t for t in traces)
+
+
+@pytest.mark.asyncio
+async def test_summary_result_remains_deliverable_through_the_delivery_path():
+    from types import SimpleNamespace
+
+    from backend.ai.context.provenance import strip_ai_provenance_marker
+    from backend.ai.tools.delivery import deliver_response
+
+    provider = _ScriptedProvider(_summarizing_provider)
+    client = _FakeClient(_conversation(30))
+    context = _context_with_request(_manager(provider), client, 30)
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 30})
+
+    edits: list[str] = []
+    replies: list[str] = []
+
+    async def edit(text):
+        edits.append(text)
+
+    async def reply(text):
+        replies.append(text)
+
+    delivered = await deliver_response(
+        SimpleNamespace(edit=edit, reply=reply),
+        "خلاصه ۳۰ پیام آخر رو بده",
+        result.message,
+    )
+
+    assert result.success is True
+    assert delivered.success is True
+    assert len(edits) == 1 and replies == []
+    assert strip_ai_provenance_marker(edits[0]) == result.message.strip()
+
+
+# ── 5. Routing: analysis requests reach the provider ──
+
+
+# ── 6. Rate-limit protection: pacing, capacity, envelope ──
+
+
+def _context_with_envelope(
+    manager: ProviderManager,
+    client: Any,
+    *,
+    timeout_s: Any = None,
+) -> ToolContext:
+    """The dispatcher's request scope, with (or without) the caller's envelope."""
+    extra: dict[str, Any] = {
+        "chat_id": CHAT,
+        "request_id": "req-envelope",
+        "provider_manager": manager,
+    }
+    if timeout_s is not None:
+        extra["request_timeout_s"] = timeout_s
+    return ToolContext(
+        telegram=TelegramAPI(client),
+        owner_id=OWNER,
+        tz_str="UTC",
+        client=client,
+        extra=extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_map_calls_are_paced_instead_of_fired_as_one_burst(monkeypatch):
+    """A large history must never arrive at the provider as one simultaneous wave."""
+    import time as _time
+
+    monkeypatch.setattr(history_ai_service, "call_spacing", _REAL_CALL_SPACING)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    monkeypatch.setattr(history_ai_service, "MAX_CALL_SPACING_S", 0.05)
+    starts: list[float] = []
+
+    class _TimedProvider(_ScriptedProvider):
+        async def chat(self, messages, **kwargs):
+            starts.append(_time.monotonic())
+            return await super().chat(messages, **kwargs)
+
+    provider = _TimedProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(3)), {"count": 3})
+
+    assert result.success is True
+    assert len(starts) == 4  # 3 chunk summaries + 1 merge
+    map_starts = starts[:3]
+    gaps = [later - earlier for earlier, later in zip(map_starts, map_starts[1:])]
+    assert min(gaps) >= 0.045
+    # The merge call is sequential, so the whole phase is still not a burst.
+    assert starts[-1] - starts[0] >= 0.09
+
+
+@pytest.mark.asyncio
+async def test_map_never_exceeds_the_concurrency_cap(monkeypatch):
+    monkeypatch.setattr(history_ai_service, "call_spacing", _REAL_CALL_SPACING)
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    monkeypatch.setattr(history_ai_service, "MAX_CALL_SPACING_S", 0.01)
+    in_flight = 0
+    peak = 0
+
+    class _CountingProvider(_ScriptedProvider):
+        async def chat(self, messages, **kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            try:
+                await asyncio.sleep(0.05)
+                return await super().chat(messages, **kwargs)
+            finally:
+                in_flight -= 1
+
+    provider = _CountingProvider(_summarizing_provider)
+    result = await _run_summarize(_manager(provider), _FakeClient(_conversation(4)), {"count": 4})
+
+    assert result.success is True
+    assert peak <= history_ai_service.MAP_CONCURRENCY
+
+
+def test_call_spacing_fits_every_call_inside_the_budget():
+    spacing = _REAL_CALL_SPACING(20, 220.0)
+    assert spacing == history_ai_service.MAX_CALL_SPACING_S
+    # One call needs no wait, and a very tight budget still spaces calls.
+    assert _REAL_CALL_SPACING(1, 220.0) == 0.0
+    assert _REAL_CALL_SPACING(4, 40.0) > 0
+    # The last paced call plus its worst-case latency must still fit.
+    assert (20 - 1) * spacing + history_ai_service.ASSUMED_CALL_LATENCY_S <= 220.0
+
+
+def test_capacity_scales_with_the_request_envelope():
+    short = history_ai_service.max_map_calls(history_ai_service.llm_budget(60.0))
+    long = history_ai_service.max_map_calls(history_ai_service.llm_budget(240.0))
+    assert short < long
+    assert long >= 30
+
+
+@pytest.mark.asyncio
+async def test_a_large_history_is_refused_under_a_short_envelope_but_runs_under_the_long_one(
+    monkeypatch,
+):
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+
+    short_provider = _ScriptedProvider(_summarizing_provider)
+    short_context = _context_with_envelope(
+        _manager(short_provider), _FakeClient(_conversation(6)), timeout_s=25.0,
+    )
+    refused = await SummarizeHistoryTool(short_context).execute(short_context, {"count": 6})
+
+    assert refused.success is False
+    assert refused.data["error"] == history_ai_service.ERROR_TOO_LARGE
+    assert short_provider.calls == 0
+    assert "rate limits" in refused.message
+
+    long_provider = _ScriptedProvider(_summarizing_provider)
+    long_context = _context_with_envelope(
+        _manager(long_provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+    completed = await SummarizeHistoryTool(long_context).execute(long_context, {"count": 6})
+
+    assert completed.success is True
+    assert completed.message == "FINAL"
+
+
+@pytest.mark.asyncio
+async def test_the_request_envelope_is_what_the_service_budgets_against(monkeypatch):
+    seen: list[Any] = []
+    real = history_ai_service.llm_budget
+
+    def _record(envelope):
+        seen.append(envelope)
+        return real(envelope)
+
+    monkeypatch.setattr(history_ai_service, "llm_budget", _record)
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(3)), timeout_s=240.0,
+    )
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 3})
+
+    assert result.success is True
+    assert seen == [240.0]
+
+
+def test_ai_request_carries_the_envelope_and_the_tool_context_receives_it():
+    from backend.ai.engine.dispatcher import Dispatcher
+    from backend.ai.session.request import AIRequest
+    from backend.bot.handlers import ai_unified as handler
+
+    request = AIRequest(
+        session_id="s", user_message="m", owner_id=OWNER, chat_id=CHAT,
+        message_id=1, timeout_s=123.0,
+    )
+    assert request.timeout_s == 123.0
+
+    assert handler._AI_EXECUTE_TIMEOUT > handler._AI_TIMEOUT
+    handler_source = inspect.getsource(handler._execute_ai)
+    assert "timeout_s=_AI_EXECUTE_TIMEOUT" in handler_source
+    assert "timeout=request.timeout_s or _AI_EXECUTE_TIMEOUT" in handler_source
+    assert (
+        'extra["request_timeout_s"] = request.timeout_s'
+        in inspect.getsource(Dispatcher._build_tool_context)
+    )
+
+
+def test_trigger_exclusion_adds_no_text_heuristic_to_the_ai_path():
+    from backend.ai.tools import history_ai as history_ai_tools
+
+    tool_source = inspect.getsource(history_ai_tools)
+    service_source = inspect.getsource(history_ai_service)
+    assert "request_message_id" in tool_source          # request-scoped identity
+    assert "before_id=before_id" in service_source      # cursor, not matching
+    for source in (tool_source, service_source):
+        assert "startswith(" not in source
+        assert "has_ai_provenance_marker" not in source
+        assert "re.compile(" not in source
+
+
+# ── 7. Deadline-aware per-call timeout (long operations) ──
+#
+# The observed failure: a 1000-message summary reached the reduce step and died
+# with "the final AI step did not finish within 30s" even though the operation
+# owned a 240s envelope. Each provider call was bounded by one call's assumed
+# latency instead of by the operation's remaining budget. These tests exercise
+# the real ``asyncio.wait_for(manager.chat(...))`` bound -- not the constants.
+
+
+def _record_call_timeouts(monkeypatch) -> list[float]:
+    """Observe the real per-call bound without replacing the mechanism."""
+    seen: list[float] = []
+    real = history_ai_service.call_timeout
+
+    def _record(deadline):
+        value = real(deadline)
+        seen.append(value)
+        return value
+
+    monkeypatch.setattr(history_ai_service, "call_timeout", _record)
+    return seen
+
+
+def _reduce_timed_provider(delay: float):
+    """Scripted provider that times its FINAL (reduce) call."""
+    starts: list[float] = []
+    durations: list[float] = []
+
+    class _Instrumented(_ScriptedProvider):
+        async def chat(self, messages, **kwargs):
+            if "merge partial summaries" in messages[0]["content"]:
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                starts.append(started)
+                await asyncio.sleep(delay)
+                durations.append(loop.time() - started)
+            return await super().chat(messages, **kwargs)
+
+    return _Instrumented(_summarizing_provider), starts, durations
+
+
+@pytest.mark.asyncio
+async def test_call_timeout_is_finite_and_bounded_by_the_ceiling(monkeypatch):
+    """No deadline still means a finite bound; a deadline only ever tightens it."""
+    ceiling = history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+
+    assert history_ai_service.call_timeout(None) == ceiling
+
+    bounded = history_ai_service.call_timeout(history_ai_service.llm_deadline(10.0))
+    assert 0 < bounded <= 10.0
+    assert bounded < ceiling
+
+    expired = asyncio.get_running_loop().time() - 1.0
+    assert history_ai_service.call_timeout(expired) == 0.0
+    assert history_ai_service.remaining_s(expired) == 0.0
+    assert history_ai_service.remaining_s(None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_long_operation_lets_the_final_reduce_call_run_past_the_old_per_call_bound(
+    monkeypatch,
+):
+    """The reduce step is no longer cut at one call's assumed latency."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    # The size the previous implementation hard-capped every call at, compressed
+    # so the difference is observable in milliseconds instead of 30 seconds.
+    monkeypatch.setattr(history_ai_service, "ASSUMED_CALL_LATENCY_S", 0.05)
+    bounds = _record_call_timeouts(monkeypatch)
+    provider, starts, durations = _reduce_timed_provider(0.25)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+
+    assert result.success is True
+    assert result.message == "FINAL"
+    assert len(starts) == 1                     # exactly one reduce step
+    # The reduce call really ran longer than the old per-call cap...
+    assert durations[0] > history_ai_service.ASSUMED_CALL_LATENCY_S
+    assert durations[0] >= 0.2
+    # ...because its bound was the (finite) safety ceiling, not that cap.
+    assert bounds[-1] == history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+
+
+@pytest.mark.asyncio
+async def test_a_generous_envelope_bounds_every_call_by_the_finite_ceiling(monkeypatch):
+    """No step is capped at one call's latency, and no step is unbounded."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    ceiling = history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+    bounds = _record_call_timeouts(monkeypatch)
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+
+    assert result.success is True
+    assert len(bounds) == provider.calls >= 2   # map calls + the reduce
+    assert all(value == ceiling for value in bounds)
+    assert ceiling > history_ai_service.ASSUMED_CALL_LATENCY_S
+
+
+@pytest.mark.asyncio
+async def test_a_tighter_envelope_bounds_map_calls_and_the_reduce_by_the_budget(monkeypatch):
+    """``min(ceiling, remaining budget)``: the budget binds, above the old cap."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    ceiling = history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S
+    assumed = history_ai_service.ASSUMED_CALL_LATENCY_S
+    bounds = _record_call_timeouts(monkeypatch)
+    provider = _ScriptedProvider(_summarizing_provider)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=120.0,
+    )
+
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 6})
+
+    budget = history_ai_service.llm_budget(120.0)
+    map_values, reduce_value = bounds[:-1], bounds[-1]
+
+    assert result.success is True
+    assert len(bounds) == provider.calls >= 2
+    assert map_values
+    assert all(0 < value <= budget - assumed + 1.0 for value in map_values)
+    assert 0 < reduce_value <= budget + 1.0
+    # The budget binds (below the ceiling) yet is still far above the old cap.
+    assert map_values[0] < ceiling
+    assert map_values[0] > assumed
+    assert reduce_value > assumed
+
+
+@pytest.mark.asyncio
+async def test_a_slow_final_call_cannot_outlive_the_operation_deadline(monkeypatch):
+    """A stuck reduce is cut at the operation's deadline -- never awaited forever."""
+    monkeypatch.setattr(history_ai_service, "SUMMARIZE_CHUNK_TOKEN_BUDGET", 5)
+    # Compress the budget arithmetic so a 3s operation deadline is observable.
+    monkeypatch.setattr(history_ai_service, "ASSUMED_CALL_LATENCY_S", 1.0)
+    monkeypatch.setattr(history_ai_service, "MAX_CALL_SPACING_S", 0.2)
+    monkeypatch.setattr(history_ai_service, "MIN_PROVIDER_CALL_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(history_ai_service, "llm_budget", lambda _envelope: 3.0)
+    provider, starts, durations = _reduce_timed_provider(10.0)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(4)), timeout_s=240.0,
+    )
+
+    import time as _time
+
+    started = _time.monotonic()
+    result = await SummarizeHistoryTool(context).execute(context, {"count": 4})
+    elapsed = _time.monotonic() - started
+
+    assert result.success is False
+    assert result.data["error"] == history_ai_service.ERROR_PROVIDER
+    assert len(starts) == 1        # the reduce was started...
+    assert durations == []         # ...and cut before it could finish
+    assert elapsed < 6.0           # bounded by the deadline, not by its own 10s
+
+
+@pytest.mark.asyncio
+async def test_translation_map_calls_share_the_same_deadline_aware_bound(monkeypatch):
+    """Translation has no reduce, and its map calls use the same bound."""
+    monkeypatch.setattr(history_ai_service, "TRANSLATE_CHUNK_TOKEN_BUDGET", 5)
+    monkeypatch.setattr(history_ai_service, "ASSUMED_CALL_LATENCY_S", 0.05)
+    bounds = _record_call_timeouts(monkeypatch)
+    provider = _ScriptedProvider(_translating_provider, delay=0.2)
+    context = _context_with_envelope(
+        _manager(provider), _FakeClient(_conversation(6)), timeout_s=240.0,
+    )
+
+    result = await TranslateHistoryTool(context).execute(context, {"count": 6})
+
+    assert result.success is True
+    assert len(bounds) == provider.calls
+    # The ceiling is finite, and every call outlived the old per-call cap.
+    assert all(value == history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S for value in bounds)
+    assert history_ai_service.PROVIDER_CALL_SAFETY_TIMEOUT_S > history_ai_service.ASSUMED_CALL_LATENCY_S
+    assert sorted(set(_sent_ids(provider))) == list(range(1, 7))
+
+
+def test_the_deadline_mechanism_leaves_pacing_and_capacity_unchanged():
+    """The per-call deadline is separate from the rate-limit guard."""
+    assert history_ai_service.llm_budget(60.0) == 40.0
+    assert history_ai_service.llm_budget(240.0) == 220.0
+    assert _REAL_CALL_SPACING(20, 220.0) == history_ai_service.MAX_CALL_SPACING_S
+    assert history_ai_service.max_map_calls(history_ai_service.llm_budget(60.0)) < \
+        history_ai_service.max_map_calls(history_ai_service.llm_budget(240.0))
+    assert history_ai_service.MAP_CONCURRENCY == 2
+    assert history_ai_service.MIN_PROVIDER_CALL_TIMEOUT_S > 0
+    assert history_ai_service.DEFAULT_ENVELOPE_S == 240.0

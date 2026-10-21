@@ -1,0 +1,1077 @@
+from __future__ import annotations
+
+import asyncio
+import copy
+import errno
+import json
+import logging
+import re
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any
+
+from backend.ai.task_contract import (
+    PENDING_QUESTION_KEY,
+    WAITING_ANSWER_STATUS,
+    validate_ai_instruction,
+    validate_pending_question,
+    validate_prepared_action,
+)
+
+logger = logging.getLogger(__name__)
+TASK_STATUSES = frozenset({"active", "paused", "completed", "failed", "expired", "deleted"})
+OCCURRENCE_STATUSES = frozenset({"claimed", "running", "succeeded", "failed", "retry_pending", "cancelled", "expired", "interrupted", WAITING_ANSWER_STATUS})
+TODO_SCHEDULE_TYPE = "todo"
+SCHEDULE_TYPES = frozenset({"once", "interval", "daily", "weekly", "event", TODO_SCHEDULE_TYPE})
+# The ONE unscheduled task kind: a basic Todo. A todo row has a title, a
+# status (active/completed) and NO schedule, NO action and NO destination —
+# the owner manages it from the Todo panel. It reuses this table, this
+# repository and this version/CAS contract; the only difference is that it
+# carries nothing the scheduler could ever run (``next_run_at`` stays NULL,
+# ``actions`` stays empty), so the due-task and event-task queries can never
+# return it.
+MAX_ACTIONS = 5
+MAX_PAYLOAD_BYTES = 32768
+MAX_METADATA_BYTES = 8192
+MAX_ATTEMPTS = 3
+DB_TIMEOUT = 10.0
+# ── Todo steps (multi-step todos) ────────────────────────────────────────────
+# A step belongs to exactly ONE todo (an ``ai_tasks`` row with
+# ``schedule_type='todo'``) and is ordered inside it by ``position``. A step is
+# NOT a task: it has no schedule, no action and no occurrence, so no scheduler
+# query, occurrence path or Taskloom surface can ever reach one. The states are
+# deliberately minimal — a step is still remaining, or it is completed.
+STEP_STATUSES = frozenset({"active", "completed"})
+# The two bounds the boundary enforces. The title bound mirrors
+# ``ai_tasks.label``; the per-todo bound keeps a todo a by-hand list rather
+# than a project plan, and ``MAX_STEPS_PER_ADD`` bounds ONE call (one panel
+# message / one model request).
+MAX_STEP_TITLE_CHARS = 256
+MAX_STEPS_PER_TODO = 50
+MAX_STEPS_PER_ADD = 20
+# A step is addressed by its ORDINAL in position order (1-based), not by the
+# raw ``position`` value: positions are never renumbered, so the ordinal is the
+# contiguous, user-visible step number while ``position`` stays stable.
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "expired", "deleted"})
+_TERMINAL_OCCURRENCE_STATUSES = frozenset({"succeeded", "failed", "cancelled", "expired"})
+# Outcomes of a real (row-removing) task deletion. ``DELETION_DELETED`` is the
+# only success; the caller must distinguish a missing task, a
+# stale CAS version, and a degraded in-memory deletion from it.
+DELETION_DELETED = "deleted"
+DELETION_NOT_FOUND = "not_found"
+DELETION_STALE = "stale"
+# ``deleted`` is NOT a transition TARGET: deletion is a real row removal the
+# repository performs (``delete_task``), never a lifecycle status write. The
+# status stays in TASK_STATUSES so a pre-existing row that already carries it
+# remains readable, and such a legacy row can only ever be updated to itself.
+# ``completed -> active`` is the REOPEN edge, and it exists for one row kind
+# only: a todo (``schedule_type='todo'``), whose lifecycle is active <->
+# completed and which has no schedule to reschedule. It is deliberately NOT in
+# this table: a completed SCHEDULED task stays terminal (resuming one would
+# have to invent a new execution boundary for it), and that rule is enforced
+# here — see ``_task_status_transition_allowed``.
+_ALLOWED_TASK_TRANSITIONS = {"active": {"active", "paused", "completed", "failed", "expired"}, "paused": {"paused", "active"}, "completed": {"completed"}, "failed": {"failed"}, "expired": {"expired"}, "deleted": {"deleted"}}
+# ── Durable questions (Part 3D) ─────────────────────────────────────────────
+# A claimed occurrence may park on ``waiting_answer`` while its ONE question
+# action waits for the owner's correlated reply. It is the ONE non-terminal
+# status that is neither a retry nor a running action: no scheduler query,
+# recovery rule, attempt count or claim CAS ever consumes it — the ONLY edge
+# that leaves it is ``resume_waiting_for_answer`` (the CAS that consumes the
+# correlated answer) and, in recovery, a bounded cancel path. Terminal
+# occurrences and ``waiting_answer`` rows are excluded from every list the
+# scheduler/recovery polls, exactly like succeeded/failed history.
+_PARKED_ANSWER_STATUS = WAITING_ANSWER_STATUS
+
+_ALLOWED_OCCURRENCE_TRANSITIONS = {
+    "claimed": {"claimed", "running", "cancelled", "expired", "interrupted"},
+    "running": {"running", "succeeded", "failed", "retry_pending", "cancelled", "interrupted", WAITING_ANSWER_STATUS},
+    "retry_pending": {"retry_pending", "running", "failed", "cancelled", "interrupted"},
+    "succeeded": {"succeeded"},
+    "failed": {"failed"},
+    "cancelled": {"cancelled"},
+    "expired": {"expired"},
+    "interrupted": {"interrupted", "retry_pending", "failed"},
+    WAITING_ANSWER_STATUS: {WAITING_ANSWER_STATUS},
+}
+
+
+# Degraded-store reasons. ``unavailable`` is claimed ONLY when the failure is
+# evidence the durable store could not be reached; a local OS resource
+# shortage is recorded separately so no surface falsely reports a Supabase
+# outage. Both remain degraded (non-durable): the read/write still happened
+# through the shared in-memory fallback.
+FALLBACK_REASON_UNAVAILABLE = "unavailable"
+FALLBACK_REASON_LOCAL_RESOURCE = "local_resource"
+# errnos that mean THIS process/host could not acquire a resource (a blocking
+# ``connect()`` auto-binding an ephemeral port, an exhausted fd table, an
+# exhausted memory/route cache). They are transient local conditions and say
+# nothing about the durable store's availability.
+_LOCAL_RESOURCE_ERRNOS = frozenset(
+    code for code in (
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EMFILE", None),
+        getattr(errno, "ENFILE", None),
+        getattr(errno, "ENOMEM", None),
+        getattr(errno, "ENOBUFS", None),
+    )
+    if code
+)
+
+# Exactly one occurrence column is pure DIAGNOSTICS: ``preparation_metadata``
+# stores the prepared-action audit record (and, for a single-action AI task, the
+# durably prepared action). It is written on the same update that performs the
+# real state transition, so a schema-cache drift on THIS column (live:
+# PGRST204 "Could not find the 'preparation_metadata' column") would otherwise
+# cost the durable status change itself. The transition is retried without an
+# optional audit field when (and only when) the status really changes, so the
+# durable state is persisted honestly and the dropped field is reported.
+_OPTIONAL_OCCURRENCE_AUDIT_FIELDS = frozenset({"preparation_metadata"})
+_UNKNOWN_COLUMN_RE = re.compile(r"could not find the '([^']+)' column", re.IGNORECASE)
+
+
+def _missing_column(exc) -> str | None:
+    """The column named by a PostgREST "column not found" error, if any."""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for text in (getattr(current, "message", None), str(current)):
+            if isinstance(text, str):
+                match = _UNKNOWN_COLUMN_RE.search(text)
+                if match:
+                    return match.group(1).strip()
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _is_unknown_column_error(exc) -> bool:
+    """True when the failure is PostgREST's unknown-column/PGRST204 error."""
+    if _missing_column(exc) is not None:
+        return True
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if str(getattr(current, "code", "") or "").upper() == "PGRST204":
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _drifted_optional_audit_field(exc, outgoing: dict) -> str | None:
+    """The single optional audit field a schema-drift error refers to.
+
+    Returns a key only when the error is a genuine unknown-column/PGRST204
+    failure AND exactly one optional audit field is present in the update, so
+    a drift on a REQUIRED column is never silently stripped.
+    """
+    if not _is_unknown_column_error(exc):
+        return None
+    present = [key for key in outgoing if key in _OPTIONAL_OCCURRENCE_AUDIT_FIELDS]
+    return present[0] if len(present) == 1 else None
+
+
+# A local OS resource failure is a transient condition of THIS process, and
+# every incoming Telegram event would otherwise re-issue the same doomed
+# Supabase HTTP call through ``list_event_tasks`` — one warning pair per event,
+# against a resource that is already short. After such a failure the durable
+# path is skipped for this BOUNDED window and the existing in-memory fallback
+# (identical degraded semantics to the failure it replaces) is served instead,
+# then the durable path is retried automatically. Bounded, deterministic,
+# automatic expiry, cleared immediately by any successful durable operation —
+# no retry loop, no second client, no global behaviour change.
+_LOCAL_RESOURCE_COOLDOWN_SECONDS = 5.0
+
+
+class LocalResourceCooldown(RuntimeError):
+    """Internal: the durable path is skipped inside one bounded cooldown window.
+
+    Carries the truthful classification so a skipped call can never be
+    re-classified as a store outage by the caller's degradation handler.
+    """
+
+    reason = FALLBACK_REASON_LOCAL_RESOURCE
+
+
+def _classify_degradation(exc) -> str:
+    """The truthful degradation reason for one failure (never collapsed).
+
+    A cooldown-skipped call carries its classification on the exception, so a
+    skipped operation is never reported as a Supabase outage.
+    """
+    if getattr(exc, "reason", None) == FALLBACK_REASON_LOCAL_RESOURCE:
+        return FALLBACK_REASON_LOCAL_RESOURCE
+    return (
+        FALLBACK_REASON_LOCAL_RESOURCE
+        if _is_local_resource_failure(exc)
+        else FALLBACK_REASON_UNAVAILABLE
+    )
+
+
+def _is_local_resource_failure(exc) -> bool:
+    """True when a failure is a LOCAL resource shortage, not a store outage.
+
+    ``httpx``/``httpcore`` wrap the raw ``OSError`` from the local socket
+    layer in a transport error, so the whole ``__cause__``/``__context__``
+    chain is walked. CPython raises ``RuntimeError`` (never an ``OSError``)
+    when a thread cannot start, and this codebase spawns no subprocess, so an
+    ``OSError`` carrying one of ``_LOCAL_RESOURCE_ERRNOS`` comes from the OS
+    socket layer under the synchronous Supabase HTTP call — e.g. a blocking
+    ``connect()`` with no free ephemeral port (EAGAIN).
+    """
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        code = getattr(current, "errno", None)
+        if isinstance(code, int) and code in _LOCAL_RESOURCE_ERRNOS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _now(): return datetime.now(timezone.utc)
+def _copy(value): return copy.deepcopy(value)
+def _json_bytes(value): return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode())
+def is_todo_schedule_type(value) -> bool:
+    """True when a schedule_type names the unscheduled Todo kind."""
+    return str(value or "").strip().casefold() == TODO_SCHEDULE_TYPE
+def _task_status_transition_allowed(task, status) -> bool:
+    """The table above, plus the ONE edge it cannot express: a todo reopens.
+
+    ``completed -> active`` is granted to a ``schedule_type='todo'`` row only.
+    Every other completed task keeps the terminal rule the table states, so a
+    scheduled task can never be silently resumed into the scheduler.
+    """
+    if status in _ALLOWED_TASK_TRANSITIONS[task.status]:
+        return True
+    return task.status == "completed" and status == "active" and is_todo_schedule_type(task.schedule_type)
+def _validate_json_payload(value, *, array=False, metadata=False, allow_empty_array=False):
+    if array and (not isinstance(value, list) or not (0 if allow_empty_array else 1) <= len(value) <= MAX_ACTIONS): raise ValueError(("action payload must contain 0 through 5 actions" if allow_empty_array else "action payload must contain 1 through 5 actions"))
+    if metadata and not isinstance(value, dict): raise ValueError("metadata must be an object")
+    if _json_bytes(value) > (MAX_METADATA_BYTES if metadata else MAX_PAYLOAD_BYTES): raise ValueError("JSON payload exceeds its bounded size")
+def _validate_task_input(data):
+    if not isinstance(data.get("owner_id"), int): raise ValueError("owner_id must be an integer")
+    if not isinstance(data.get("label"), str) or not data["label"].strip() or len(data["label"]) > 256: raise ValueError("label must be a nonblank bounded string")
+    if data.get("status", "active") not in TASK_STATUSES: raise ValueError("invalid task status")
+    if data.get("schedule_type") not in SCHEDULE_TYPES: raise ValueError("invalid schedule type")
+    todo = is_todo_schedule_type(data.get("schedule_type"))
+    # A todo has no schedule, so it must never carry a due instant: the
+    # scheduler only ever runs a row whose next_run_at is set, and letting a
+    # todo hold one would make an unscheduled item executable. A scheduled
+    # task keeps its mandatory 1-5 action payload; only a todo may store none
+    # (never a fabricated placeholder action).
+    if todo and data.get("next_run_at") is not None: raise ValueError("a todo has no schedule and therefore no next run")
+    if not isinstance(data.get("timezone"), str) or not data["timezone"].strip() or len(data["timezone"]) > 128: raise ValueError("timezone must be a bounded nonblank string")
+    if not isinstance(data.get("schedule"), dict): raise ValueError("schedule must be an object")
+    if not isinstance(data.get("notification_destination"), dict): raise ValueError("notification destination must be an object")
+    if data.get("ai_instruction") is not None: validate_ai_instruction(data["ai_instruction"])
+    _validate_json_payload(data.get("actions"), array=True, allow_empty_array=todo)
+    if _json_bytes(data["schedule"]) > 16384 or _json_bytes(data["notification_destination"]) > 4096: raise ValueError("task JSON payload exceeds its bounded size")
+def _validate_occurrence_input(data):
+    if not isinstance(data.get("owner_id"), int): raise ValueError("owner_id must be an integer")
+    if not isinstance(data.get("occurrence_key"), str) or not data["occurrence_key"].strip() or len(data["occurrence_key"]) > 256: raise ValueError("occurrence_key must be a bounded nonblank string")
+    if not isinstance(data.get("definition_version"), int) or data["definition_version"] < 1: raise ValueError("definition_version must be positive")
+    if data.get("status", "claimed") not in OCCURRENCE_STATUSES: raise ValueError("invalid occurrence status")
+    if not isinstance(data.get("attempt", 1), int) or not 1 <= data.get("attempt", 1) <= MAX_ATTEMPTS: raise ValueError("attempt must be between 1 and 3")
+    if data.get("preparation_metadata") is not None:
+        _validate_json_payload(data["preparation_metadata"], metadata=True)
+        preparation = data["preparation_metadata"]
+        if preparation and set(preparation) != {"kind", "definition_version", "prepared_at", "action"}:
+            raise ValueError("invalid preparation metadata fields")
+        if preparation:
+            if preparation.get("kind") != "prepared_action":
+                raise ValueError("invalid preparation metadata kind")
+            if not isinstance(preparation.get("definition_version"), int) or preparation["definition_version"] < 1:
+                raise ValueError("invalid preparation definition version")
+            if not isinstance(preparation.get("prepared_at"), str) or not preparation["prepared_at"].strip():
+                raise ValueError("invalid preparation timestamp")
+            validate_prepared_action(preparation.get("action"))
+    _validate_json_payload(data.get("action_snapshot"), array=True); _validate_json_payload(data.get("error_metadata", {}), metadata=True); _validate_json_payload(data.get("result_metadata", {}), metadata=True)
+    if data.get("status") == "retry_pending" and data.get("retry_at") is None: raise ValueError("retry_pending requires retry_at")
+    if data.get("status") == WAITING_ANSWER_STATUS:
+        record = data.get("result_metadata")
+        pending = (record or {}).get(PENDING_QUESTION_KEY) if isinstance(record, dict) else None
+        if not pending:
+            raise ValueError("waiting_answer requires a pending_question record")
+        try:
+            validate_pending_question(pending)
+        except ValueError as exc:
+            raise ValueError(f"invalid pending question record: {exc}") from exc
+def normalize_step_title(value) -> str:
+    """The owner's own words for a step, whitespace-collapsed and bounded.
+
+    Shared by BOTH boundaries that store a step title (creating a todo with its
+    steps, and adding or renaming one later), so a step title can never be
+    stored in two different forms. A blank or over-long title is rejected here
+    instead of being stored as a placeholder.
+    """
+    text = " ".join(str(value or "").split())
+    if not text or len(text) > MAX_STEP_TITLE_CHARS: raise ValueError(f"a step needs a title of at most {MAX_STEP_TITLE_CHARS} characters")
+    return text
+def _validate_step_input(data):
+    if not isinstance(data.get("owner_id"), int): raise ValueError("owner_id must be an integer")
+    if not isinstance(data.get("task_id"), int) or data["task_id"] <= 0: raise ValueError("task_id must be a positive integer")
+    if not isinstance(data.get("position"), int) or data["position"] <= 0: raise ValueError("position must be positive")
+    title = data.get("title")
+    if not isinstance(title, str) or not title.strip() or len(title) > MAX_STEP_TITLE_CHARS: raise ValueError("a step needs a nonblank bounded title")
+    if data.get("status", "active") not in STEP_STATUSES: raise ValueError("invalid step status")
+    if not isinstance(data.get("version", 1), int) or data["version"] < 1: raise ValueError("version must be positive")
+def _parse_dt(value):
+    if value is None or (not isinstance(value, datetime) and not str(value).strip()): return None
+    if isinstance(value, datetime): parsed = value
+    else:
+        try: parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError): return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+def _serialize(value): return value.isoformat() if isinstance(value, datetime) else value
+
+@dataclass
+class TaskDeletionResult:
+    """Outcome of a real (row-removing) task deletion.
+
+    ``outcome`` distinguishes a durable removal from a missing task, a stale
+    CAS version, and a degraded deletion. ``fallback_backend`` is set exactly
+    when the mutation happened in the shared in-memory fallback — mirroring
+    ``create_task``/``update_task``: such a deletion is never durable.
+    """
+    outcome: str; task_id: int; task: TaskRecord | None = None; fallback_backend: str = ""; fallback_reason: str = ""
+    @property
+    def deleted(self) -> bool: return self.outcome == DELETION_DELETED
+    @property
+    def durable(self) -> bool: return self.deleted and not self.fallback_backend
+
+@dataclass
+class TaskRecord:
+    id: int; owner_id: int; label: str; schedule_type: str; schedule: dict[str, Any]; timezone: str; actions: list[dict[str, Any]]; notification_destination: dict[str, Any]; status: str = "active"; version: int = 1; next_run_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); terminal_at: datetime | None = None; ai_instruction: str | None = None
+    def as_dict(self): return _copy(self.__dict__)
+@dataclass
+class OccurrenceRecord:
+    id: int; task_id: int; owner_id: int; occurrence_key: str; definition_version: int; action_snapshot: list[dict[str, Any]]; scheduled_for: datetime; attempt: int = 1; status: str = "claimed"; claimed_at: datetime | None = None; started_at: datetime | None = None; finished_at: datetime | None = None; retry_at: datetime | None = None; error_metadata: dict[str, Any] = field(default_factory=dict); result_metadata: dict[str, Any] = field(default_factory=dict); created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now); preparation_metadata: dict[str, Any] = field(default_factory=dict)
+    def as_dict(self): return _copy(self.__dict__)
+@dataclass
+class TodoStepRecord:
+    """One ordered step of ONE todo (never a task of its own)."""
+    id: int; task_id: int; owner_id: int; position: int; title: str; status: str = "active"; version: int = 1; completed_at: datetime | None = None; created_at: datetime = field(default_factory=_now); updated_at: datetime = field(default_factory=_now)
+    def as_dict(self): return _copy(self.__dict__)
+    @property
+    def completed(self) -> bool: return self.status == "completed"
+
+def _task_from_row(row):
+    value = {**row, "id": int(row["id"]), "owner_id": int(row["owner_id"]), "version": int(row.get("version", 1))}
+    value.setdefault("ai_instruction", None)
+    for key in ("created_at", "updated_at", "next_run_at", "terminal_at"): value[key] = _parse_dt(value.get(key))
+    value["schedule"] = dict(value.get("schedule") or {}); value["actions"] = list(value.get("actions") or []); value["notification_destination"] = dict(value.get("notification_destination") or {}); _validate_task_input(value)
+    return TaskRecord(**{key: value[key] for key in TaskRecord.__dataclass_fields__})
+def _occurrence_from_row(row):
+    value = {**row, "id": int(row["id"]), "task_id": int(row["task_id"]), "owner_id": int(row["owner_id"]), "definition_version": int(row["definition_version"]), "attempt": int(row.get("attempt", 1)), "status": row.get("status", "claimed")}
+    for key in ("scheduled_for", "claimed_at", "started_at", "finished_at", "retry_at", "created_at", "updated_at"): value[key] = _parse_dt(value.get(key))
+    value["action_snapshot"] = list(value.get("action_snapshot") or []); value["error_metadata"] = dict(value.get("error_metadata") or {}); value["result_metadata"] = dict(value.get("result_metadata") or {}); value["preparation_metadata"] = dict(value.get("preparation_metadata") or {}); _validate_occurrence_input(value)
+    return OccurrenceRecord(**{key: value[key] for key in OccurrenceRecord.__dataclass_fields__})
+
+def _step_from_row(row):
+    value = {**row, "id": int(row["id"]), "task_id": int(row["task_id"]), "owner_id": int(row["owner_id"]), "position": int(row["position"]), "version": int(row.get("version", 1)), "status": row.get("status", "active")}
+    for key in ("completed_at", "created_at", "updated_at"): value[key] = _parse_dt(value.get(key))
+    _validate_step_input(value)
+    return TodoStepRecord(**{key: value[key] for key in TodoStepRecord.__dataclass_fields__})
+
+class TaskRepository:
+    async def create_task(self, owner_id, data): raise NotImplementedError
+    async def get_task(self, owner_id, task_id): raise NotImplementedError
+    async def list_tasks(self, owner_id): raise NotImplementedError
+    async def list_due_tasks(self, owner_id, now, limit=10): raise NotImplementedError
+    async def list_event_tasks(self, owner_id, limit=10): raise NotImplementedError
+    async def update_task(self, owner_id, task_id, expected_version, updates): raise NotImplementedError
+    async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): raise NotImplementedError
+    async def transition_task(self, owner_id, task_id, status, expected_version=None): raise NotImplementedError
+    async def delete_task(self, owner_id, task_id, expected_version): raise NotImplementedError
+    async def create_occurrence(self, owner_id, data): raise NotImplementedError
+    async def get_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
+    async def list_occurrences(self, owner_id, task_id=None, limit=100): raise NotImplementedError
+    async def list_recoverable_occurrences(self, owner_id, limit=100): raise NotImplementedError
+    async def list_due_retry_occurrences(self, owner_id, now, limit=10): raise NotImplementedError
+    async def list_waiting_answer_occurrences(self, owner_id, limit=10): raise NotImplementedError
+    async def resume_waiting_for_answer(
+        self, owner_id, task_id, occurrence_key, *, answer, answer_metadata
+    ): raise NotImplementedError
+    async def claim_occurrence(self, owner_id, task_id, occurrence_key): raise NotImplementedError
+    async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates): raise NotImplementedError
+    async def next_run_hint(self, owner_id): raise NotImplementedError
+    async def discard_unstarted_occurrences(self, owner_id, task_id, reference): raise NotImplementedError
+    # Todo steps: the ordered children of ONE todo. ``create_steps`` appends the
+    # whole list or nothing, and every mutation is owner-scoped and CAS-guarded
+    # on the STEP's own version (a step is not the todo, so a step edit never
+    # invalidates the todo's version — and vice versa).
+    async def create_steps(self, owner_id, task_id, titles): raise NotImplementedError
+    async def list_steps(self, owner_id, task_id): raise NotImplementedError
+    async def get_step(self, owner_id, step_id): raise NotImplementedError
+    async def update_step(self, owner_id, step_id, expected_version, updates): raise NotImplementedError
+    async def delete_step(self, owner_id, step_id, expected_version): raise NotImplementedError
+
+class InMemoryTaskRepository(TaskRepository):
+    def __init__(self, id_floor: int = 0):
+        self._tasks={}; self._occurrences={}; self._steps={}; self._next_occurrence_id=1; self._next_step_id=1
+        # Provisional task ids start above ``id_floor``: when this repository
+        # acts as the degraded store beside Supabase it must never reuse an id
+        # the durable PostgreSQL sequence already issued, nor restart its
+        # numbering at 1 while durable tasks exist.
+        self._id_floor=max(0, int(id_floor)); self._next_task_id=self._id_floor+1
+    def never_issue_ids_below(self, highest_durable_id: int) -> None:
+        """Raise the provisional id floor above a durable id.
+
+        PostgreSQL ``bigserial`` stays the only durable id allocator: this
+        floor is applied to the degraded in-memory store only, so a memory
+        task can never be handed an id the durable sequence already used.
+        """
+        floor=max(0, int(highest_durable_id))
+        if floor>self._id_floor: self._id_floor=floor
+        if self._next_task_id<=self._id_floor: self._next_task_id=self._id_floor+1
+    async def create_task(self, owner_id, data):
+        payload={**data,"owner_id":owner_id}; _validate_task_input(payload); r=TaskRecord(self._next_task_id,owner_id,payload["label"].strip(),payload["schedule_type"],_copy(payload["schedule"]),payload["timezone"].strip(),_copy(payload["actions"]),_copy(payload["notification_destination"]),payload.get("status","active"),1,payload.get("next_run_at"),ai_instruction=payload.get("ai_instruction")); self._tasks[r.id]=r; self._next_task_id+=1; return _copy(r)
+    async def get_task(self, owner_id, task_id):
+        r=self._tasks.get(task_id); return _copy(r) if r and r.owner_id==owner_id else None
+    async def list_tasks(self, owner_id): return [_copy(r) for r in self._tasks.values() if r.owner_id==owner_id]
+    async def list_due_tasks(self, owner_id, now, limit=10):
+        ref=_parse_dt(now); return sorted([_copy(r) for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.next_run_at is not None and r.next_run_at<=ref], key=lambda r:(r.next_run_at,r.id))[:max(0,limit)]
+    async def next_run_hint(self, owner_id):
+        """Earliest FUTURE boundary among the owner's active tasks, or None.
+
+        Advisory only (the wake loop bounds its own sleep): it lets the
+        scheduler sleep until the nearest boundary instead of a fixed poll,
+        so a task is neither late nor polled every minute forever.
+        """
+        ref=_now(); upcoming=[r.next_run_at for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.next_run_at is not None and r.next_run_at>ref]
+        return min(upcoming) if upcoming else None
+    async def discard_unstarted_occurrences(self, owner_id, task_id, reference):
+        """Remove the task's FUTURE, never-started occurrences.
+
+        Used by the definition-edit path: an unstarted (`claimed`, not yet
+        due) occurrence carries the OLD definition_version/action_snapshot,
+        so it must not execute after the task was edited. Started/terminal
+        occurrences are history and are never touched.
+        """
+        ref=_parse_dt(reference)
+        removed=[k for k,occ in self._occurrences.items() if occ.owner_id==owner_id and occ.task_id==task_id and occ.status=="claimed" and occ.scheduled_for is not None and ref is not None and occ.scheduled_for>ref]
+        for key in removed: del self._occurrences[key]
+        return len(removed)
+    async def list_event_tasks(self, owner_id, limit=10):
+        return sorted([_copy(r) for r in self._tasks.values() if r.owner_id==owner_id and r.status=="active" and r.schedule_type=="event"], key=lambda r:r.id)[:max(0,limit)]
+    async def update_task(self, owner_id, task_id, expected_version, updates):
+        r=self._tasks.get(task_id)
+        if not r or r.owner_id!=owner_id or r.version!=expected_version:return None
+        if updates.get("status") and not _task_status_transition_allowed(r,updates["status"]):raise ValueError("invalid task status transition")
+        merged=r.as_dict();merged.update(updates);merged["owner_id"]=owner_id;_validate_task_input(merged)
+        for k in ("label","schedule_type","schedule","timezone","actions","notification_destination","status","next_run_at","ai_instruction"):setattr(r,k,_copy(merged.get(k,getattr(r,k))))
+        r.version+=1;r.updated_at=_now()
+        if r.status in _TERMINAL_TASK_STATUSES and r.terminal_at is None:r.terminal_at=r.updated_at
+        return _copy(r)
+    async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): return await self.update_task(owner_id,task_id,expected_version,{"next_run_at":next_run_at})
+    async def transition_task(self, owner_id, task_id, status, expected_version=None):
+        r=await self.get_task(owner_id,task_id)
+        if not r:return None
+        if status not in TASK_STATUSES or not _task_status_transition_allowed(r,status):raise ValueError("invalid task status transition")
+        return await self.update_task(owner_id,task_id,expected_version if expected_version is not None else r.version,{"status":status})
+    async def delete_task(self, owner_id, task_id, expected_version):
+        r=self._tasks.get(task_id)
+        if not r or r.owner_id!=owner_id:return TaskDeletionResult(DELETION_NOT_FOUND,task_id)
+        if r.version!=expected_version:return TaskDeletionResult(DELETION_STALE,task_id,task=_copy(r))
+        del self._tasks[task_id]
+        # Occurrences are the task's children (ai_task_occurrences.task_id is
+        # ON DELETE RESTRICT): they go with the row they belong to, exactly as
+        # the durable store must delete them before it can remove the task.
+        for key in [k for k,occ in self._occurrences.items() if occ.task_id==task_id and occ.owner_id==owner_id]: del self._occurrences[key]
+        # Steps are the todo's OWN children (todo_steps.task_id is
+        # ON DELETE CASCADE): the durable store removes them in the same
+        # statement, so the degraded store mirrors that exactly — no step row
+        # may outlive the todo it belongs to.
+        for key in [k for k,step in self._steps.items() if step.task_id==task_id and step.owner_id==owner_id]: del self._steps[key]
+        return TaskDeletionResult(DELETION_DELETED,task_id,task=_copy(r))
+    async def create_occurrence(self, owner_id, data):
+        payload={**data,"owner_id":owner_id};task=self._tasks.get(payload.get("task_id"))
+        if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
+        _validate_occurrence_input(payload);key=(payload["task_id"],payload["occurrence_key"])
+        if key in self._occurrences:return _copy(self._occurrences[key])
+        r=OccurrenceRecord(self._next_occurrence_id,payload["task_id"],owner_id,payload["occurrence_key"].strip(),payload["definition_version"],_copy(payload["action_snapshot"]),payload["scheduled_for"],payload.get("attempt",1),payload.get("status","claimed"),payload.get("claimed_at"),payload.get("started_at"),payload.get("finished_at"),payload.get("retry_at"),_copy(payload.get("error_metadata",{})),_copy(payload.get("result_metadata",{})),preparation_metadata=_copy(payload.get("preparation_metadata",{})));self._occurrences[key]=r;self._next_occurrence_id+=1;return _copy(r)
+    async def get_occurrence(self, owner_id, task_id, occurrence_key):
+        r=self._occurrences.get((task_id,occurrence_key));return _copy(r) if r and r.owner_id==owner_id else None
+    async def list_occurrences(self, owner_id, task_id=None, limit=100): return [_copy(r) for r in list(self._occurrences.values()) if r.owner_id==owner_id and (task_id is None or r.task_id==task_id)][:max(0,limit)]
+    async def list_recoverable_occurrences(self, owner_id, limit=100): return [_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status in {"claimed","running","interrupted"}][:max(0,limit)]
+    async def list_due_retry_occurrences(self, owner_id, now, limit=10):
+        ref=_parse_dt(now); return sorted([_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status=="retry_pending" and r.retry_at is not None and r.retry_at<=ref], key=lambda r:(r.retry_at,r.id))[:max(0,limit)]
+    async def list_waiting_answer_occurrences(self, owner_id, limit=10):
+        """The owner's occurrences parked on an open question (order-stable)."""
+        return sorted([_copy(r) for r in self._occurrences.values() if r.owner_id==owner_id and r.status==WAITING_ANSWER_STATUS], key=lambda r:(r.updated_at,r.id))[:max(0,limit)]
+    async def resume_waiting_for_answer(self, owner_id, task_id, occurrence_key, *, answer, answer_metadata):
+        """The ONE resume edge for a parked question: park → retry_pending(now).
+
+        ONE in-memory dict write carries the whole consume atomically with
+        respect to the event loop: the answer metadata, the succeeded question
+        run record, and the eligibility instant. A second correlated reply
+        finds the occurrence already ``retry_pending``/``running`` and is
+        refused by the transition rule (ValueError) — the downstream actions
+        can never be executed twice by a duplicate answer.
+        """
+        r=self._occurrences.get((task_id,occurrence_key))
+        if not r or r.owner_id!=owner_id or r.status!=WAITING_ANSWER_STATUS:
+            return None
+        now=_now()
+        r.result_metadata=_copy(answer_metadata)
+        r.error_metadata={}
+        r.status="retry_pending"; r.retry_at=now; r.updated_at=now
+        r.finished_at=None
+        return _copy(r)
+    async def claim_occurrence(self, owner_id, task_id, occurrence_key):
+        r=self._occurrences.get((task_id,occurrence_key))
+        if not r or r.owner_id!=owner_id or r.status not in {"claimed","retry_pending","interrupted"}:return None
+        r.status="running";r.claimed_at=r.claimed_at or _now();r.started_at=_now();r.updated_at=_now();return _copy(r)
+    async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates):
+        r=self._occurrences.get((task_id,occurrence_key))
+        if not r or r.owner_id!=owner_id:return None
+        if status not in OCCURRENCE_STATUSES or status not in _ALLOWED_OCCURRENCE_TRANSITIONS[r.status]:raise ValueError("invalid occurrence status transition")
+        candidate={**r.as_dict(),**updates,"status":status};_validate_occurrence_input(candidate)
+        for k,v in updates.items():
+            if k in {"action_snapshot","occurrence_key","task_id","owner_id","definition_version","scheduled_for"}:raise ValueError("immutable occurrence field")
+            setattr(r,k,_copy(v))
+        r.status=status;r.updated_at=_now()
+        if status in _TERMINAL_OCCURRENCE_STATUSES:r.finished_at=r.finished_at or r.updated_at
+        return _copy(r)
+    def _task_steps(self, owner_id, task_id):
+        """The owner's steps of ONE todo, in position order (never renumbered)."""
+        return sorted((r for r in self._steps.values() if r.owner_id==owner_id and r.task_id==task_id), key=lambda r:(r.position,r.id))
+    async def create_steps(self, owner_id, task_id, titles):
+        """Append steps to ONE todo in the order given — all of them or none.
+
+        Every row is validated BEFORE the store is touched, so a rejected
+        title leaves no step behind (the durable path gets the same guarantee
+        from ONE multi-row INSERT statement). Positions continue from the
+        current maximum; they are never reused and never renumbered.
+        """
+        titles=list(titles)
+        task=self._tasks.get(int(task_id))
+        if not task or task.owner_id!=owner_id:raise ValueError("task not found for owner")
+        position=max([r.position for r in self._task_steps(owner_id,int(task_id))] or [0])
+        if position+len(titles)>MAX_STEPS_PER_TODO:raise ValueError(f"a todo holds at most {MAX_STEPS_PER_TODO} steps")
+        prepared=[]
+        for index,title in enumerate(titles):
+            payload={"owner_id":owner_id,"task_id":int(task_id),"position":position+index+1,"title":title,"status":"active","version":1}
+            _validate_step_input(payload); prepared.append(payload)
+        stored=[]
+        for payload in prepared:
+            r=TodoStepRecord(self._next_step_id,payload["task_id"],owner_id,payload["position"],str(payload["title"]).strip())
+            self._steps[r.id]=r; self._next_step_id+=1; stored.append(_copy(r))
+        return stored
+    async def list_steps(self, owner_id, task_id):
+        return [_copy(r) for r in self._task_steps(owner_id,int(task_id))]
+    async def get_step(self, owner_id, step_id):
+        r=self._steps.get(step_id); return _copy(r) if r and r.owner_id==owner_id else None
+    async def update_step(self, owner_id, step_id, expected_version, updates):
+        """CAS-guarded step edit; the status/completed_at pair always agrees."""
+        r=self._steps.get(step_id)
+        if not r or r.owner_id!=owner_id or r.version!=expected_version:return None
+        for key in ("id","task_id","owner_id","position","created_at"):
+            if key in updates:raise ValueError("immutable step field")
+        target=str(updates.get("status",r.status))
+        if target not in STEP_STATUSES:raise ValueError("invalid step status")
+        merged={**r.as_dict(),**updates,"status":target};_validate_step_input(merged)
+        r.title=str(merged["title"]).strip();r.status=target;r.completed_at=(r.completed_at or _now()) if target=="completed" else None
+        r.version+=1;r.updated_at=_now()
+        return _copy(r)
+    async def delete_step(self, owner_id, step_id, expected_version):
+        """Remove ONE step under CAS. Returns True only on a real removal."""
+        r=self._steps.get(step_id)
+        if not r or r.owner_id!=owner_id or r.version!=expected_version:return False
+        del self._steps[step_id];return True
+
+class SupabaseTaskRepository(TaskRepository):
+    def __init__(self, client, fallback=None, timeout=DB_TIMEOUT):
+        self._client=client;self._fallback=fallback or InMemoryTaskRepository();self._timeout=timeout;self._fallback_active=False;self._fallback_reason=""
+        # Bounded local-resource cooldown (monotonic deadline; 0.0 = inactive)
+        # and "this continuous degradation episode was already reported".
+        self._local_resource_until=0.0;self._degraded_announced=False;self._audit_drop_announced=False
+        # Highest durable task id this process has observed. PostgreSQL's
+        # bigserial sequence stays the ONLY allocator of durable ids; this is
+        # never written to the database — it is only a floor handed to the
+        # degraded in-memory store so a memory task can never reuse a durable
+        # id (nor restart its numbering at 1 while durable tasks exist).
+        self._max_durable_task_id=0
+    @property
+    def fallback_active(self) -> bool:
+        """True when the most recent Supabase operation degraded to memory.
+
+        Diagnostic-only: a read or write that fell back to the in-memory
+        repository is NOT durable and must not be presented as such. The
+        flag is cleared again after the next successful Supabase operation.
+        """
+        return self._fallback_active
+    @property
+    def fallback_reason(self) -> str:
+        """Why the last operation degraded ("" while healthy).
+
+        ``FALLBACK_REASON_UNAVAILABLE`` is set only when the failure is
+        evidence the durable store could not be reached;
+        ``FALLBACK_REASON_LOCAL_RESOURCE`` marks a local OS resource error,
+        which must never be rendered as "Supabase unavailable".
+        """
+        return self._fallback_reason
+    def _mark_supabase_ok(self) -> None:
+        """Durable success: clear the degraded state AND any local cooldown.
+
+        Recovery is immediate — a single successful durable operation proves the
+        resource condition has cleared, so the next read/write goes to Supabase
+        again with no residual backoff.
+        """
+        self._fallback_active = False
+        self._fallback_reason = ""
+        self._local_resource_until = 0.0
+        self._degraded_announced = False
+        self._audit_drop_announced = False
+    def _in_local_resource_cooldown(self) -> bool:
+        """True while the bounded post-local-failure window is still open."""
+        return time.monotonic() < self._local_resource_until
+    def _mark_fallback(self, exc=None) -> None:
+        """Enter the degraded state with a TRUTHFUL reason.
+
+        Every exception still degrades (resilience is unchanged); only the
+        REASON is classified, so a local resource error never becomes a
+        "Supabase unavailable" claim while a real store failure still does.
+
+        A local-resource failure additionally arms the bounded cooldown, and
+        its structured ``TASK_FALLBACK_CLASSIFIED`` diagnostic is emitted ONCE
+        per continuous episode — the per-operation warning at each call site
+        is deduplicated the same way by ``_degrade``.
+        """
+        local = _classify_degradation(exc) == FALLBACK_REASON_LOCAL_RESOURCE
+        self._fallback_active = True
+        self._fallback_reason = (
+            FALLBACK_REASON_LOCAL_RESOURCE if local else FALLBACK_REASON_UNAVAILABLE
+        )
+        if not local:
+            # A store-level failure is not a local-resource episode: never let a
+            # stale cooldown hide it, and never suppress its reporting.
+            self._local_resource_until = 0.0
+            self._degraded_announced = False
+            return
+        if getattr(exc, "reason", None) == FALLBACK_REASON_LOCAL_RESOURCE:
+            # A cooldown-SKIPPED call must not extend the window: otherwise a
+            # continuous stream of events would keep pushing the deadline
+            # forward and the durable path would never be retried.
+            return
+        self._local_resource_until = time.monotonic() + _LOCAL_RESOURCE_COOLDOWN_SECONDS
+        if self._degraded_announced:
+            return
+        self._degraded_announced = True
+        # Structured diagnostic: the per-operation warning logs the exception
+        # string, which is the OS text for the local errno and by itself cannot
+        # distinguish a local resource shortage from a store outage (that is
+        # the exact gap that made the live misclassification possible).
+        logger.warning(
+            "TASK_FALLBACK_CLASSIFIED reason=%s exception=%s message=%s",
+            self._fallback_reason, type(exc).__name__, str(exc)[:200],
+        )
+    def _degrade(self, message: str, exc: Exception, *, align_ids: bool = False) -> None:
+        """Enter the degraded state and report it — at most once per episode.
+
+        ``message`` keeps the call site's own wording and carries exactly one
+        ``%s`` for the exception. A sustained local-resource condition must not
+        emit a fresh warning pair for every caller (every incoming Telegram
+        event), so only the FIRST failure of an episode is logged; a genuine
+        store failure, and the first failure after recovery, are always logged.
+        """
+        local = _classify_degradation(exc) == FALLBACK_REASON_LOCAL_RESOURCE
+        announce = (not local) or (not self._degraded_announced)
+        if align_ids:
+            self._degrade_to_fallback(exc)
+        else:
+            self._mark_fallback(exc)
+        if announce:
+            logger.warning(message, exc)
+    def _annotate_fallback(self, record):
+        if record is not None:
+            record.fallback_backend = type(self._fallback).__name__
+            record.fallback_reason = self._fallback_reason
+        return record
+    def _annotate_deletion(self, result):
+        result.fallback_backend = type(self._fallback).__name__
+        result.fallback_reason = self._fallback_reason
+        return result
+    def _observe_durable_task(self, record) -> None:
+        task_id = record.get("id") if isinstance(record, dict) else getattr(record, "id", None)
+        if isinstance(task_id, int) and task_id > self._max_durable_task_id:
+            self._max_durable_task_id = task_id
+    def _degrade_to_fallback(self, exc=None) -> None:
+        """Enter the degraded state and align the fallback's provisional ids."""
+        self._mark_fallback(exc)
+        advance = getattr(self._fallback, "never_issue_ids_below", None)
+        if callable(advance):
+            advance(self._max_durable_task_id)
+    async def _observe_durable_ceiling(self, owner_id: int) -> None:
+        """Best-effort durable id ceiling before degrading to memory.
+
+        A failed write does not prove the reads are down: learn the highest
+        durable id first so the fallback cannot restart its numbering at 1
+        while durable tasks exist. Any failure here is irrelevant — the
+        fallback is already non-durable.
+        """
+        try:
+            result = await self._run_checked(lambda: self._client.table("ai_tasks").select("id").eq("owner_id", owner_id).order("id", desc=True).limit(1).execute(), timeout=min(self._timeout, 3.0))
+            rows = getattr(result, "data", None) or []
+            if rows:
+                self._observe_durable_task(rows[0])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+    async def _run(self, fn):
+        # Synchronous Supabase work goes through the DB layer's single bounded
+        # pool: a fresh worker per call let task persistence and the audit paths
+        # together occupy an unbounded share of the loop's shared default
+        # executor and hold one socket per concurrent call on the one shared
+        # client.
+        from backend.db.client import run_sync_db
+        if self._in_local_resource_cooldown():
+            raise LocalResourceCooldown()
+        try:return await run_sync_db(fn,timeout=self._timeout)
+        except asyncio.CancelledError:raise
+    async def _run_checked(self, fn, timeout=None):
+        """Like ``_run`` but propagates failures.
+
+        ``_run`` swallows every failure (returning None); a durable delete
+        must be able to tell a real row removal from a swallowed transport
+        failure before it reports durability, so it uses this variant.
+        """
+        from backend.db.client import run_sync_db
+        if self._in_local_resource_cooldown():
+            raise LocalResourceCooldown()
+        return await run_sync_db(fn,timeout=timeout or self._timeout)
+    def _task_payload(self, owner_id, data):
+        payload={**data,"owner_id":owner_id};_validate_task_input(payload);return {k:_serialize(v) for k,v in payload.items() if k not in {"id","created_at","updated_at","terminal_at","version"}}
+    def _occurrence_payload(self, owner_id, data):
+        payload={**data,"owner_id":owner_id};_validate_occurrence_input(payload);return {k:_serialize(v) for k,v in payload.items() if k not in {"id","created_at","updated_at"}}
+    async def create_task(self, owner_id, data):
+        payload=self._task_payload(owner_id,data)
+        logger.info("TASK_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s", type(self).__name__, owner_id)
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").insert(payload).execute());row=getattr(result,"data",None)
+            if not row:raise RuntimeError("Supabase task insert returned no row")
+            self._mark_supabase_ok()
+            record = _task_from_row(row[0] if isinstance(row,list) else row)
+            self._observe_durable_task(record)
+            logger.info("TASK_PERSIST_CREATE_SUCCESS repository=%s task_id=%s", type(self).__name__, record.id)
+            return record
+        except (ValueError,TypeError):raise
+        except Exception as exc:
+            await self._observe_durable_ceiling(owner_id)
+            self._degrade(
+                f"TASK_PERSIST_FALLBACK repository={type(self).__name__} "
+                "operation=create_task exception=%s",
+                exc, align_ids=True,
+            )
+            logger.warning("AI_TASK_TRACE stage=create_task_fallback_start backend=InMemoryTaskRepository reason=%s detail=%s", type(exc).__name__, str(exc)[:160])
+            try:
+                record = await self._fallback.create_task(owner_id,data)
+            except asyncio.CancelledError:
+                raise
+            except Exception as fallback_exc:
+                logger.warning("AI_TASK_TRACE stage=create_task_fallback_result success=false exception=%s detail=%s", type(fallback_exc).__name__, str(fallback_exc)[:160])
+                raise
+            logger.info("AI_TASK_TRACE stage=create_task_fallback_result success=true task_id=%s version=%s backend=InMemoryTaskRepository", record.id, record.version)
+            # Observability annotation (not a schema field): lets the caller's
+            # terminal trace report the true final backend and fallback usage.
+            record.fallback_backend = type(self._fallback).__name__
+            record.fallback_reason = self._fallback_reason
+            return record
+    async def get_task(self, owner_id, task_id):
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            if not row:return None
+            record=_task_from_row(row[0] if isinstance(row,list) else row);self._observe_durable_task(record);return record
+        except Exception as exc:self._degrade("Supabase task read failed; using fallback: %s",exc);return await self._fallback.get_task(owner_id,task_id)
+    async def list_tasks(self, owner_id):
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).order("updated_at",desc=True).execute());self._mark_supabase_ok()
+            records=[_task_from_row(row) for row in (getattr(result,"data",None) or [])]
+            for record in records:self._observe_durable_task(record)
+            return records
+        except Exception as exc:self._degrade("Supabase task list failed; using fallback: %s",exc);return await self._fallback.list_tasks(owner_id)
+    async def list_due_tasks(self, owner_id, now, limit=10):
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").lte("next_run_at",_serialize(now)).order("next_run_at").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase due task query failed; using fallback: %s",exc);return await self._fallback.list_due_tasks(owner_id,now,limit)
+    async def next_run_hint(self, owner_id):
+        """Earliest future boundary (advisory). Never degrades the store."""
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("next_run_at").eq("owner_id",owner_id).eq("status","active").order("next_run_at").limit(1).execute())
+        except asyncio.CancelledError:raise
+        except Exception:return None
+        rows=getattr(result,"data",None) or []
+        if not rows:return None
+        return _parse_dt(rows[0].get("next_run_at"))
+    async def discard_unstarted_occurrences(self, owner_id, task_id, reference):
+        """Delete the task's future, never-started occurrences (edit path)."""
+        try:
+            result=await self._run_checked(lambda:self._client.table("ai_task_occurrences").delete().eq("owner_id",owner_id).eq("task_id",task_id).eq("status","claimed").gt("scheduled_for",_serialize(reference)).execute())
+            self._mark_supabase_ok()
+            rows=getattr(result,"data",None)
+            return len(rows) if isinstance(rows,list) else 0
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase unstarted occurrence discard failed; using fallback: %s",exc)
+            return await self._fallback.discard_unstarted_occurrences(owner_id,task_id,reference)
+    async def list_event_tasks(self, owner_id, limit=10):
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").select("*").eq("owner_id",owner_id).eq("status","active").eq("schedule_type","event").order("id").limit(limit).execute());self._mark_supabase_ok();return [_task_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase event task query failed; using fallback: %s",exc);return await self._fallback.list_event_tasks(owner_id,limit)
+    async def update_task(self, owner_id, task_id, expected_version, updates):
+        current=await self.get_task(owner_id,task_id)
+        if current is None or current.version!=expected_version:return None
+        if "status" in updates and not _task_status_transition_allowed(current,updates["status"]):raise ValueError("invalid task status transition")
+        merged=current.as_dict();merged.update(updates);merged["owner_id"]=owner_id;_validate_task_input(merged);outgoing={k:_serialize(v) for k,v in updates.items() if k not in {"id","created_at","updated_at","terminal_at","version"}};outgoing["version"]=expected_version+1
+        if updates.get("status") in _TERMINAL_TASK_STATUSES and current.terminal_at is None:outgoing["terminal_at"]=_now().isoformat()
+        try:
+            result=await self._run(lambda:self._client.table("ai_tasks").update(outgoing).eq("id",task_id).eq("owner_id",owner_id).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _task_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError):raise
+        except Exception as exc:self._degrade("Supabase task update failed; using fallback: %s",exc);return self._annotate_fallback(await self._fallback.update_task(owner_id,task_id,expected_version,updates))
+    async def advance_next_run(self, owner_id, task_id, expected_version, next_run_at): return await self.update_task(owner_id,task_id,expected_version,{"next_run_at":next_run_at})
+    async def transition_task(self, owner_id, task_id, status, expected_version=None):
+        current=await self.get_task(owner_id,task_id)
+        if not current:return None
+        if status not in TASK_STATUSES or not _task_status_transition_allowed(current,status):raise ValueError("invalid task status transition")
+        return await self.update_task(owner_id,task_id,expected_version if expected_version is not None else current.version,{"status":status})
+    async def delete_task(self, owner_id, task_id, expected_version):
+        """Physically DELETE the owner's task row (never a status write).
+
+        Occurrences are deleted first: ``ai_task_occurrences.task_id`` is
+        ``ON DELETE RESTRICT``, so PostgreSQL refuses to remove a task that
+        still has children. The task delete is CAS-guarded on the version and
+        its affected rows are what decides the reported outcome — a swallowed
+        failure is never reported as a durable deletion.
+        """
+        try:
+            result=await self._run_checked(lambda:self._client.table("ai_tasks").select("*").eq("id",task_id).eq("owner_id",owner_id).maybe_single().execute())
+            row=getattr(result,"data",None)
+            record=_task_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase task delete read failed; using fallback: %s",exc,align_ids=True)
+            return self._annotate_deletion(await self._fallback.delete_task(owner_id,task_id,expected_version))
+        if record is None:
+            self._mark_supabase_ok()
+            return TaskDeletionResult(DELETION_NOT_FOUND,task_id)
+        if record.version!=expected_version:
+            self._mark_supabase_ok()
+            return TaskDeletionResult(DELETION_STALE,task_id,task=record)
+        try:
+            await self._run_checked(lambda:self._client.table("ai_task_occurrences").delete().eq("task_id",task_id).eq("owner_id",owner_id).execute())
+            deleted=await self._run_checked(lambda:self._client.table("ai_tasks").delete().eq("id",task_id).eq("owner_id",owner_id).eq("version",expected_version).execute())
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase task delete failed; using fallback: %s",exc,align_ids=True)
+            return self._annotate_deletion(await self._fallback.delete_task(owner_id,task_id,expected_version))
+        rows=getattr(deleted,"data",None)
+        self._mark_supabase_ok()
+        if not rows:
+            # The row changed or disappeared between the CAS read and the
+            # delete: no durable row removal can be claimed.
+            return TaskDeletionResult(DELETION_STALE,task_id,task=record)
+        return TaskDeletionResult(DELETION_DELETED,task_id,task=record)
+    async def create_occurrence(self, owner_id, data):
+        task=await self.get_task(owner_id,int(data.get("task_id",0)))
+        if not task:raise ValueError("task not found for owner")
+        payload=self._occurrence_payload(owner_id,data)
+        try:
+            existing=await self.get_occurrence(owner_id,payload["task_id"],payload["occurrence_key"])
+            if existing:return existing
+            logger.info("TASK_OCCURRENCE_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s task_id=%s", type(self).__name__, owner_id, payload["task_id"])
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").insert(payload).execute());row=getattr(result,"data",None)
+            if not row:raise RuntimeError("Supabase occurrence insert returned no row")
+            self._mark_supabase_ok()
+            record = _occurrence_from_row(row[0] if isinstance(row,list) else row)
+            logger.info("TASK_OCCURRENCE_PERSIST_CREATE_SUCCESS repository=%s occurrence_id=%s", type(self).__name__, record.id)
+            return record
+        except (ValueError,TypeError):raise
+        except Exception as exc:
+            self._degrade(
+                f"TASK_OCCURRENCE_PERSIST_FALLBACK repository={type(self).__name__} "
+                "operation=create_occurrence exception=%s",
+                exc,
+            )
+            return await self._fallback.create_occurrence(owner_id,data)
+    async def get_occurrence(self, owner_id, task_id, occurrence_key):
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except Exception as exc:self._degrade("Supabase occurrence read failed; using fallback: %s",exc);return await self._fallback.get_occurrence(owner_id,task_id,occurrence_key)
+    async def list_occurrences(self, owner_id, task_id=None, limit=100):
+        try:
+            query=self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id)
+            if task_id is not None:query=query.eq("task_id",task_id)
+            result=await self._run(lambda:query.order("scheduled_for",desc=True).limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase occurrence list failed; using fallback: %s",exc);return await self._fallback.list_occurrences(owner_id,task_id,limit)
+    async def list_recoverable_occurrences(self, owner_id, limit=100):
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).in_("status",["claimed","running","interrupted"]).order("updated_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase recovery query failed; using fallback: %s",exc);return await self._fallback.list_recoverable_occurrences(owner_id,limit)
+    async def list_due_retry_occurrences(self, owner_id, now, limit=10):
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status","retry_pending").lte("retry_at",_serialize(now)).order("retry_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase retry query failed; using fallback: %s",exc);return await self._fallback.list_due_retry_occurrences(owner_id,now,limit)
+    async def list_waiting_answer_occurrences(self, owner_id, limit=10):
+        """The owner's parked questions (oldest first); degrades to the fallback."""
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").select("*").eq("owner_id",owner_id).eq("status",WAITING_ANSWER_STATUS).order("updated_at").limit(limit).execute());self._mark_supabase_ok();return [_occurrence_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except asyncio.CancelledError:raise
+        except Exception as exc:self._degrade("Supabase pending-question query failed; using fallback: %s",exc);return await self._fallback.list_waiting_answer_occurrences(owner_id,limit)
+    async def claim_occurrence(self, owner_id, task_id, occurrence_key):
+        current=await self.get_occurrence(owner_id,task_id,occurrence_key)
+        if not current or current.status not in {"claimed","retry_pending","interrupted"}:return None
+        now=_now().isoformat()
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").update({"status":"running","claimed_at":current.claimed_at.isoformat() if current.claimed_at else now,"started_at":now,"updated_at":now}).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current.status).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except Exception as exc:self._degrade("Supabase occurrence claim failed; using fallback: %s",exc);return await self._fallback.claim_occurrence(owner_id,task_id,occurrence_key)
+    async def _occurrence_transition_write(self, owner_id, task_id, occurrence_key, current_status, outgoing):
+        """One CAS update: only the row still in ``current_status`` may move."""
+        return await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",current_status).execute())
+    async def transition_occurrence(self, owner_id, task_id, occurrence_key, status, **updates):
+        current=await self.get_occurrence(owner_id,task_id,occurrence_key)
+        if not current:return None
+        if status not in OCCURRENCE_STATUSES or status not in _ALLOWED_OCCURRENCE_TRANSITIONS[current.status]:raise ValueError("invalid occurrence status transition")
+        immutable={"action_snapshot","occurrence_key","task_id","owner_id","definition_version","scheduled_for"}
+        if immutable.intersection(updates):raise ValueError("immutable occurrence field")
+        candidate={**current.as_dict(),**updates,"status":status};_validate_occurrence_input(candidate);outgoing={k:_serialize(v) for k,v in updates.items()};outgoing["status"]=status;outgoing["updated_at"]=_now().isoformat()
+        if status in _TERMINAL_OCCURRENCE_STATUSES:outgoing.setdefault("finished_at",_now().isoformat())
+        try:
+            result=await self._occurrence_transition_write(owner_id,task_id,occurrence_key,current.status,outgoing)
+        except (ValueError,TypeError):raise
+        except Exception as exc:
+            # A schema-cache drift on the OPTIONAL diagnostics column must
+            # not cost the durable STATE transition (live: an occurrence whose
+            # actions already ran could not be marked succeeded, so recovery
+            # reported a false failure — and a retry could repeat a completed
+            # Telegram side effect). The status change is retried without the
+            # audit field; if that also fails the store is honestly degraded.
+            result=None
+            drifted=_drifted_optional_audit_field(exc,outgoing) if status!=current.status else None
+            if drifted is not None:
+                trimmed={k:v for k,v in outgoing.items() if k!=drifted}
+                try:
+                    result=await self._occurrence_transition_write(owner_id,task_id,occurrence_key,current.status,trimmed)
+                except asyncio.CancelledError:raise
+                except Exception:result=None
+                if result is not None:
+                    if not self._audit_drop_announced:
+                        self._audit_drop_announced=True
+                        logger.warning(
+                            "TASK_OCCURRENCE_AUDIT_FIELD_DROPPED repository=%s column=%s status=%s "
+                            "exception=%s detail=%s durable_state_transition=persisted",
+                            type(self).__name__,drifted,status,type(exc).__name__,str(exc)[:160],
+                        )
+            if result is None:
+                self._degrade("Supabase occurrence transition failed; using fallback: %s",exc)
+                return await self._fallback.transition_occurrence(owner_id,task_id,occurrence_key,status,**updates)
+        row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+    async def resume_waiting_for_answer(self, owner_id, task_id, occurrence_key, *, answer, answer_metadata):
+        """The ONE resume edge for a parked question: ONE CAS write consumes it.
+
+        ``waiting_answer -> retry_pending`` is applied ONLY to the row that is
+        still parked (the ``.eq("status", ...)`` CAS guard is the duplicate
+        guard): the persisted metadata carries the bounded answer, the
+        question run's ``succeeded`` record, and the eligibility pair
+        (``retry_pending`` + ``retry_at`` = the write's own now) — so the
+        wake loop resumes the SAME occurrence through the existing claim
+        path. A racing second reply loses the CAS and returns None; it can
+        never execute the downstream chain twice. ``updated_at`` is the
+        authoritative write instant, so a stale/absent client clock can
+        never corrupt the eligibility boundary.
+        """
+        current=await self.get_occurrence(owner_id,task_id,occurrence_key)
+        if not current or current.status!=WAITING_ANSWER_STATUS:return None
+        now=_now().isoformat()
+        outgoing={k:_serialize(v) for k,v in answer_metadata.items()}
+        outgoing["error_metadata"]={};outgoing["status"]="retry_pending";outgoing["retry_at"]=now;outgoing["finished_at"]=None;outgoing["updated_at"]=now
+        try:
+            result=await self._run(lambda:self._client.table("ai_task_occurrences").update(outgoing).eq("task_id",task_id).eq("occurrence_key",occurrence_key).eq("owner_id",owner_id).eq("status",WAITING_ANSWER_STATUS).execute());row=getattr(result,"data",None);self._mark_supabase_ok();return _occurrence_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase answer-resume failed; using fallback: %s",exc)
+            return await self._fallback.resume_waiting_for_answer(owner_id,task_id,occurrence_key,answer=answer,answer_metadata=answer_metadata)
+
+    def _step_payload(self, owner_id, payload):
+        value={**payload,"owner_id":owner_id};_validate_step_input(value);return {k:_serialize(v) for k,v in value.items() if k not in {"id","created_at","updated_at"}}
+    async def create_steps(self, owner_id, task_id, titles):
+        """Append steps to ONE todo in ONE statement (all rows or none).
+
+        One multi-row INSERT is a single PostgreSQL statement, so a rejected
+        title or a transport failure leaves the todo with NO half-added step
+        list. Positions continue from the current maximum inside the caller's
+        serialized section (see ``TaskManagementService.add_steps``), and the
+        ``UNIQUE (task_id, position)`` constraint makes a duplicated order
+        structurally impossible even if that serialization is ever removed.
+        """
+        titles=list(titles)
+        try:
+            existing=await self.list_steps(owner_id,int(task_id))
+            position=max([r.position for r in existing] or [0])
+            if position+len(titles)>MAX_STEPS_PER_TODO:raise ValueError(f"a todo holds at most {MAX_STEPS_PER_TODO} steps")
+            payloads=[self._step_payload(owner_id,{"task_id":int(task_id),"position":position+index+1,"title":title,"status":"active","version":1}) for index,title in enumerate(titles)]
+            if not payloads:return []
+            logger.info("TODO_STEP_PERSIST_CREATE_ATTEMPT repository=%s owner_id=%s task_id=%s count=%s", type(self).__name__, owner_id, task_id, len(payloads))
+            result=await self._run(lambda:self._client.table("todo_steps").insert(payloads).execute());rows=getattr(result,"data",None)
+            if not rows or len(rows)!=len(payloads):raise RuntimeError("Supabase step insert returned no rows")
+            self._mark_supabase_ok()
+            return [_step_from_row(row) for row in rows]
+        except (ValueError,TypeError):raise
+        except Exception as exc:
+            self._degrade("Supabase step insert failed; using fallback: %s",exc)
+            return [self._annotate_fallback(record) for record in await self._fallback.create_steps(owner_id,int(task_id),titles)]
+    async def list_steps(self, owner_id, task_id):
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").select("*").eq("owner_id",owner_id).eq("task_id",task_id).order("position").execute());self._mark_supabase_ok()
+            return [_step_from_row(row) for row in (getattr(result,"data",None) or [])]
+        except Exception as exc:self._degrade("Supabase step list failed; using fallback: %s",exc);return await self._fallback.list_steps(owner_id,task_id)
+    async def get_step(self, owner_id, step_id):
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").select("*").eq("id",step_id).eq("owner_id",owner_id).maybe_single().execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _step_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except Exception as exc:self._degrade("Supabase step read failed; using fallback: %s",exc);return await self._fallback.get_step(owner_id,step_id)
+    async def update_step(self, owner_id, step_id, expected_version, updates):
+        current=await self.get_step(owner_id,step_id)
+        if current is None or current.version!=expected_version:return None
+        for key in ("id","task_id","owner_id","position","created_at"):
+            if key in updates:raise ValueError("immutable step field")
+        target=str(updates.get("status",current.status))
+        if target not in STEP_STATUSES:raise ValueError("invalid step status")
+        merged={**current.as_dict(),**updates,"status":target};_validate_step_input(merged)
+        outgoing={k:_serialize(v) for k,v in updates.items() if k!="status"}
+        outgoing["status"]=target
+        outgoing["completed_at"]=_serialize((current.completed_at or _now()) if target=="completed" else None)
+        outgoing["version"]=expected_version+1
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").update(outgoing).eq("id",step_id).eq("owner_id",owner_id).eq("version",expected_version).execute());row=getattr(result,"data",None);self._mark_supabase_ok()
+            return _step_from_row(row[0] if isinstance(row,list) else row) if row else None
+        except (ValueError,TypeError):raise
+        except Exception as exc:self._degrade("Supabase step update failed; using fallback: %s",exc);return self._annotate_fallback(await self._fallback.update_step(owner_id,step_id,expected_version,updates))
+    async def delete_step(self, owner_id, step_id, expected_version):
+        """Remove ONE step under CAS; False means nothing was removed."""
+        current=await self.get_step(owner_id,step_id)
+        if current is None or current.version!=expected_version:return False
+        try:
+            result=await self._run(lambda:self._client.table("todo_steps").delete().eq("id",step_id).eq("owner_id",owner_id).eq("version",expected_version).execute())
+        except asyncio.CancelledError:raise
+        except Exception as exc:
+            self._degrade("Supabase step delete failed; using fallback: %s",exc)
+            return await self._fallback.delete_step(owner_id,step_id,expected_version)
+        rows=getattr(result,"data",None);self._mark_supabase_ok()
+        return bool(rows)
+
+def get_task_repository():
+    """Return the process-wide task repository (single authority).
+
+    The RepositoryManager owns the one task repository instance; the
+    scheduler and the AI tool/service layer must share it so a Supabase
+    outage degrades to ONE in-memory fallback instead of two divergent
+    copies (tasks created through the tools must be visible to the
+    scheduler and vice versa).
+    """
+    from backend.ai.database.manager import get_repository_manager
+    return get_repository_manager().task
